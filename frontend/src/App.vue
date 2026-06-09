@@ -33,6 +33,7 @@ const qaQuestion = ref('')
 const qaLoading = ref(false)
 const qaError = ref('')
 const qaHistory = ref<{ question: string; answer: string }[]>([])
+const qaOpen = ref(false)
 
 interface WorkflowStep {
   html: string
@@ -279,17 +280,35 @@ onMounted(checkHealth)
         <h3>代码规范</h3>
         <p>{{ result.coding_conventions }}</p>
       </div>
+    </div>
+  </div>
 
-      <div class="card qa-section">
-        <h3>仓库问答</h3>
-        <p class="qa-hint">基于已分析的项目信息回答问题，例如：项目是做什么的？架构是怎样的？如何贡献？</p>
-        <div v-if="qaHistory.length" class="qa-history">
+  <!-- FAB -->
+  <button v-if="result" class="qa-fab" @click="qaOpen = true">⌕ 问仓库</button>
+
+  <!-- Modal -->
+  <template v-if="qaOpen">
+    <div class="qa-overlay" @click="qaOpen = false"></div>
+    <div class="qa-modal">
+      <div class="qa-modal-header">
+        <div>
+          <div class="qa-modal-title">仓库问答</div>
+          <div class="qa-modal-project">{{ result!.project_name }}</div>
+        </div>
+        <button class="qa-modal-close" @click="qaOpen = false">&times;</button>
+      </div>
+      <div class="qa-modal-body">
+        <div v-if="qaHistory.length" class="qa-modal-history">
           <div v-for="(item, i) in qaHistory" :key="i" class="qa-item">
             <div class="qa-q">{{ item.question }}</div>
             <div class="qa-a" v-html="renderMarkdown(item.answer)"></div>
           </div>
         </div>
-        <div class="input-row">
+        <div v-else class="qa-modal-empty">输入问题，基于已分析的项目信息回答。例如：项目是做什么的？架构是怎样的？</div>
+      </div>
+      <div class="qa-modal-footer">
+        <div v-if="qaError" class="qa-modal-error">{{ qaError }}</div>
+        <div class="qa-modal-input">
           <input
             v-model="qaQuestion"
             type="text"
@@ -301,8 +320,7 @@ onMounted(checkHealth)
             {{ qaLoading ? '回答中...' : '提问' }}
           </button>
         </div>
-        <div v-if="qaError" class="error-notice">{{ qaError }}</div>
       </div>
     </div>
-  </div>
+  </template>
 </template>

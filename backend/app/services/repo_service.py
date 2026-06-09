@@ -10,7 +10,7 @@ MAX_TREE_ENTRIES_PER_DIR = 50
 MAX_FILE_SIZE = 100_000
 
 GITHUB_URL_PATTERN = re.compile(
-    r"^https?://github\.com/(?P<owner>[A-Za-z0-9_.-]+)/(?P<repo>[A-Za-z0-9_.-]+)/?$"
+    r"^https?://github\.com/(?P<owner>[A-Za-z0-9_.-]+)/(?P<repo>[A-Za-z0-9_.-]+?)(?:\.git)?/?$"
 )
 
 IGNORED_DIRS = {
@@ -27,8 +27,16 @@ CONFIG_FILENAMES = [
 ]
 
 
+def normalize_repo_url(repo_url: str) -> str:
+    url = repo_url.strip().rstrip("/")
+    if url.endswith(".git"):
+        url = url[:-4]
+    return url
+
+
 def generate_analysis_id(repo_url: str) -> str:
-    return hashlib.md5(repo_url.encode()).hexdigest()[:12]
+    normalized = normalize_repo_url(repo_url)
+    return hashlib.md5(normalized.encode()).hexdigest()[:12]
 
 
 def parse_github_url(repo_url: str) -> tuple[str, str]:
