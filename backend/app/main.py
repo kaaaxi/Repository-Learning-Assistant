@@ -4,7 +4,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.config import DEMO_MODE
-from app.models import AnalyzeRequest
+from app.models import AnalyzeRequest, ChatRequest
 from app.services import analysis_service, storage_service
 
 app = FastAPI(title="RepoAssistant", version="0.1.0")
@@ -42,3 +42,14 @@ def get_analysis(analysis_id: str):
         return storage_service.load_analysis(analysis_id)
     except FileNotFoundError:
         raise HTTPException(status_code=404, detail=f"Analysis not found: {analysis_id}")
+
+
+@app.post("/api/chat")
+def chat(req: ChatRequest):
+    if not req.question.strip():
+        raise HTTPException(status_code=400, detail="question cannot be empty")
+    try:
+        analysis = storage_service.load_analysis(req.analysis_id)
+    except FileNotFoundError:
+        raise HTTPException(status_code=404, detail=f"Analysis not found: {req.analysis_id}")
+    return analysis_service.chat_fallback(analysis, req.question)
