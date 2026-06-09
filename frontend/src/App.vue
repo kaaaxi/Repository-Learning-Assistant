@@ -28,6 +28,11 @@ const loading = ref(false)
 const errorMsg = ref('')
 const result = ref<AnalysisResult | null>(null)
 
+const qaQuestion = ref('')
+const qaLoading = ref(false)
+const qaError = ref('')
+const qaHistory = ref<{ question: string; answer: string }[]>([])
+
 async function checkHealth() {
   try {
     const res = await fetch(`${API_BASE}/api/health`)
@@ -60,6 +65,32 @@ async function analyze() {
     errorMsg.value = e.message || 'Network error'
   } finally {
     loading.value = false
+  }
+}
+
+async function askQuestion() {
+  if (!result.value) return
+  const q = qaQuestion.value.trim()
+  if (!q) return
+  qaError.value = ''
+  qaLoading.value = true
+  try {
+    const res = await fetch(`${API_BASE}/api/chat`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ analysis_id: result.value.analysis_id, question: q }),
+    })
+    const data = await res.json()
+    if (!res.ok) {
+      qaError.value = data.detail || 'Chat failed'
+      return
+    }
+    qaHistory.value.push({ question: q, answer: data.answer })
+    qaQuestion.value = ''
+  } catch (e: any) {
+    qaError.value = e.message || 'Network error'
+  } finally {
+    qaLoading.value = false
   }
 }
 
@@ -159,6 +190,30 @@ onMounted(checkHealth)
       <div class="card">
         <h3>代码规范</h3>
         <p>{{ result.coding_conventions }}</p>
+      </div>
+
+      <div class="card qa-section">
+        <h3>仓库问答</h3>
+        <p class="qa-hint">基于已分析的项目信息回答问题，例如：项目是做什么的？架构是怎样的？如何贡献？</p>
+        <div v-if="qaHistory.length" class="qa-history">
+          <div v-for="(item, i) in qaHistory" :key="i" class="qa-item">
+            <div class="qa-q">{{ item.question }}</div>
+            <div class="qa-a">{{ item.answer }}</div>
+          </div>
+        </div>
+        <div class="input-row">
+          <input
+            v-model="qaQuestion"
+            type="text"
+            placeholder="输入你的问题..."
+            :disabled="qaLoading"
+            @keyup.enter="askQuestion"
+          />
+          <button :disabled="qaLoading || !qaQuestion.trim()" @click="askQuestion">
+            {{ qaLoading ? '回答中...' : '提问' }}
+          </button>
+        </div>
+        <div v-if="qaError" class="error-notice">{{ qaError }}</div>
       </div>
     </div>
   </div>
