@@ -38,6 +38,7 @@ class AnalysisResult(BaseModel):
     project_name: str
     repo_url: str
     overview: str
+    directory_tree: str
     architecture_summary: str
     code_map: list[CodeMapItem]
     key_modules: list[KeyModule]

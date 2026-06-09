@@ -29,7 +29,7 @@ ANALYSIS_SYSTEM_PROMPT = """\
   "contribution_suggestions": [
     {"title": "建议标题", "description": "具体说明", "difficulty": "beginner/intermediate"}
   ],
-  "developer_workflow": "开发流程说明，包含常用命令",
+  "developer_workflow": "编号开发流程，每个步骤单独一行，步骤中的命令必须用反引号包裹",
   "coding_conventions": "代码规范和风格说明"
 }
 
@@ -38,6 +38,11 @@ ANALYSIS_SYSTEM_PROMPT = """\
 - key_modules 列出最值得优先阅读的 3-5 个模块，key_files 填入实际存在的文件路径
 - learning_path 提供 4-5 步学习建议，从易到难
 - contribution_suggestions 提供 3-4 条入门贡献建议
+- developer_workflow 必须使用编号步骤格式，每个步骤独占一行，例如：
+  1. 克隆仓库后安装依赖：`uv sync`。
+  2. 运行测试：`pytest tests/` 或 `tox run -e py312`。
+  3. 运行格式检查：`pre-commit run --all-files`。
+- developer_workflow 不要写成一整段长句；不要把所有命令集中到最后；命令或工具名必须保留在对应步骤里并用反引号包裹
 - 所有内容使用中文
 - 只返回 JSON，不要返回其他内容\
 """

@@ -12,6 +12,7 @@ interface AnalysisResult {
   project_name: string
   repo_url: string
   overview: string
+  directory_tree: string
   architecture_summary: string
   code_map: CodeMapItem[]
   key_modules: KeyModule[]
@@ -32,6 +33,81 @@ const qaQuestion = ref('')
 const qaLoading = ref(false)
 const qaError = ref('')
 const qaHistory = ref<{ question: string; answer: string }[]>([])
+
+interface WorkflowStep {
+  html: string
+}
+
+function formatDeveloperWorkflow(text: string): WorkflowStep[] {
+  if (!text) return []
+
+  const normalized = text.replace(/\r\n/g, '\n').trim()
+  const numberedParts = normalized
+    .split(/(?:^|\n|(?<=[。；;.!?？])\s*)(?=\d+[.)、]\s*)/g)
+    .map((part) => part.trim())
+    .filter(Boolean)
+
+  const sourceParts = numberedParts.length > 1
+    ? numberedParts
+    : normalized.split(/\n{2,}|(?<=。)\s+/).map((part) => part.trim()).filter(Boolean)
+
+  return sourceParts
+    .map((part) => part.replace(/^\d+[.)、]\s*/, '').trim())
+    .filter(Boolean)
+    .map((part) => ({ html: renderInlineMarkdown(part) }))
+}
+
+function escapeHtml(text: string): string {
+  return text
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+}
+
+function renderMarkdown(text: string): string {
+  const escaped = escapeHtml(text)
+
+  const codeBlocks: string[] = []
+  let processed = escaped.replace(/```([\s\S]*?)```/g, (_match, code: string) => {
+    const idx = codeBlocks.length
+    codeBlocks.push(`<pre class="md-code-block"><code>${code.trim()}</code></pre>`)
+    return `%%CODEBLOCK_${idx}%%`
+  })
+
+  processed = processed.replace(/`([^`\n]+)`/g, '<code class="md-inline-code">$1</code>')
+  processed = processed.replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>')
+
+  const lines = processed.split('\n')
+  const out: string[] = []
+  let inUl = false
+
+  for (const line of lines) {
+    if (line.startsWith('%%CODEBLOCK_')) {
+      if (inUl) { out.push('</ul>'); inUl = false }
+      const idx = parseInt(line.match(/%%CODEBLOCK_(\d+)%%/)?.[1] || '0')
+      out.push(codeBlocks[idx])
+      continue
+    }
+    const ulMatch = line.match(/^[-*]\s+(.+)/)
+    if (ulMatch) {
+      if (!inUl) { out.push('<ul class="md-list">'); inUl = true }
+      out.push(`<li>${ulMatch[1]}</li>`)
+    } else {
+      if (inUl) { out.push('</ul>'); inUl = false }
+      out.push(line === '' ? '' : `<p>${line}</p>`)
+    }
+  }
+  if (inUl) out.push('</ul>')
+
+  return out.join('\n')
+}
+
+function renderInlineMarkdown(text: string): string {
+  return escapeHtml(text)
+    .replace(/`([^`\n]+)`/g, '<code class="workflow-inline-code">$1</code>')
+    .replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>')
+}
 
 async function checkHealth() {
   try {
@@ -140,7 +216,12 @@ onMounted(checkHealth)
 
       <div class="card">
         <h3>目录</h3>
-        <pre>{{ result.architecture_summary }}</pre>
+        <pre>{{ result.directory_tree }}</pre>
+      </div>
+
+      <div class="card">
+        <h3>架构摘要</h3>
+        <p>{{ result.architecture_summary }}</p>
       </div>
 
       <div class="card">
@@ -184,7 +265,14 @@ onMounted(checkHealth)
 
       <div class="card">
         <h3>开发流程</h3>
-        <pre>{{ result.developer_workflow }}</pre>
+        <div class="workflow-list">
+          <div v-for="(step, idx) in formatDeveloperWorkflow(result.developer_workflow)" :key="idx" class="workflow-step">
+            <div class="workflow-step-title">
+              <span class="workflow-index">{{ idx + 1 }}</span>
+              <span v-html="step.html"></span>
+            </div>
+          </div>
+        </div>
       </div>
 
       <div class="card">
@@ -198,7 +286,7 @@ onMounted(checkHealth)
         <div v-if="qaHistory.length" class="qa-history">
           <div v-for="(item, i) in qaHistory" :key="i" class="qa-item">
             <div class="qa-q">{{ item.question }}</div>
-            <div class="qa-a">{{ item.answer }}</div>
+            <div class="qa-a" v-html="renderMarkdown(item.answer)"></div>
           </div>
         </div>
         <div class="input-row">

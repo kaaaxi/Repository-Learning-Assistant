@@ -2,6 +2,7 @@ import json
 from pathlib import Path
 
 from app.services import repo_service, storage_service
+from app.services import llm_service
 
 import re as _re
 
@@ -223,7 +224,8 @@ def build_fallback_result(ctx: dict, repo_url: str, sample_sources: list[str]) -
         "project_name": project_name,
         "repo_url": repo_url,
         "overview": readme_preview,
-        "architecture_summary": f"主要语言：{language}。顶层目录：{', '.join(top_dirs) or '无'}。目录树：\n{tree_text}",
+        "directory_tree": tree_text,
+        "architecture_summary": f"主要语言：{language}。顶层目录：{', '.join(top_dirs) or '无'}。",
         "code_map": code_map,
         "key_modules": key_modules,
         "learning_path": [
@@ -353,6 +355,17 @@ def analyze(repo_url: str) -> dict:
 
     repo_path = Path(ctx["repo_path"])
     sample_sources = _extract_sample_sources(repo_path, ctx.get("directory_tree", ""))
+
+    llm_context = {**ctx, "sample_sources": sample_sources}
+    llm_result = llm_service.analyze_with_llm(llm_context)
+
+    if llm_result is not None:
+        llm_result.setdefault("analysis_id", ctx["analysis_id"])
+        llm_result.setdefault("project_name", ctx.get("project_name", "unknown"))
+        llm_result.setdefault("repo_url", repo_url)
+        llm_result["directory_tree"] = ctx["directory_tree"]
+        storage_service.save_analysis(analysis_id, llm_result)
+        return llm_result
 
     result = build_fallback_result(ctx, repo_url, sample_sources)
     storage_service.save_analysis(analysis_id, result)

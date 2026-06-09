@@ -5,7 +5,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from app.config import DEMO_MODE
 from app.models import AnalyzeRequest, ChatRequest
-from app.services import analysis_service, storage_service
+from app.services import analysis_service, llm_service, storage_service
 
 app = FastAPI(title="RepoAssistant", version="0.1.0")
 
@@ -52,4 +52,7 @@ def chat(req: ChatRequest):
         analysis = storage_service.load_analysis(req.analysis_id)
     except FileNotFoundError:
         raise HTTPException(status_code=404, detail=f"Analysis not found: {req.analysis_id}")
+    llm_answer = llm_service.chat_with_llm(analysis, req.question)
+    if llm_answer is not None:
+        return {"answer": llm_answer}
     return analysis_service.chat_fallback(analysis, req.question)
