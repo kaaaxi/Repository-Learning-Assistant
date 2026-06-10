@@ -1,6 +1,7 @@
 import json
 from pathlib import Path
 
+from app.config import DEMO_MODE
 from app.services import repo_service, storage_service
 from app.services import llm_service
 
@@ -223,6 +224,7 @@ def build_fallback_result(ctx: dict, repo_url: str, sample_sources: list[str]) -
         "analysis_id": ctx["analysis_id"],
         "project_name": project_name,
         "repo_url": repo_url,
+        "analysis_mode": "demo",
         "overview": readme_preview,
         "directory_tree": tree_text,
         "architecture_summary": f"主要语言：{language}。顶层目录：{', '.join(top_dirs) or '无'}。",
@@ -347,7 +349,11 @@ def analyze(repo_url: str) -> dict:
 
     try:
         existing = storage_service.load_analysis(analysis_id)
-        return existing
+        if DEMO_MODE:
+            return existing
+        cached_mode = existing.get("analysis_mode")
+        if cached_mode == "llm":
+            return existing
     except FileNotFoundError:
         pass
 
@@ -364,6 +370,7 @@ def analyze(repo_url: str) -> dict:
         llm_result.setdefault("project_name", ctx.get("project_name", "unknown"))
         llm_result.setdefault("repo_url", repo_url)
         llm_result["directory_tree"] = ctx["directory_tree"]
+        llm_result["analysis_mode"] = "llm"
         storage_service.save_analysis(analysis_id, llm_result)
         return llm_result
 

@@ -95,7 +95,7 @@ npm run dev
 ## 使用流程
 
 1. 启动前后端服务
-2. 打开 http://localhost:5173，确认页面顶部显示「后端已连接」
+2. 打开 http://localhost:5173 ，确认页面顶部显示「后端已连接」
 3. 在输入框中填入 GitHub 仓库 URL（如 `https://github.com/pallets/click`）
 4. 点击 **Analyze**，等待分析完成
 5. 查看项目概览、目录结构、代码地图、关键模块、学习路径和贡献建议
