@@ -1,7 +1,7 @@
 <script setup lang="ts">
-import { ref, onMounted } from 'vue'
+import { computed, ref, onMounted } from 'vue'
 
-const API_BASE = 'http://localhost:8000'
+const API_BASE = (import.meta.env.VITE_API_BASE ?? '').replace(/\/+$/, '')
 
 interface CodeMapItem { name: string; description: string }
 interface KeyModule { name: string; description: string; key_files: string[] }
@@ -20,10 +20,14 @@ interface AnalysisResult {
   contribution_suggestions: ContributionSuggestion[]
   developer_workflow: string
   coding_conventions: string
+  analysis_mode?: string
+  llm_error?: string | null
 }
 
 const backendStatus = ref<'loading' | 'ok' | 'error'>('loading')
 const demoMode = ref(false)
+const apiKeySource = ref('none')
+const modelName = ref('')
 const repoUrl = ref('')
 const loading = ref(false)
 const errorMsg = ref('')
@@ -34,6 +38,21 @@ const qaLoading = ref(false)
 const qaError = ref('')
 const qaHistory = ref<{ question: string; answer: string }[]>([])
 const qaOpen = ref(false)
+
+// 后端只报告密钥来源，不下发密钥内容
+const demoReason = computed(() => {
+  if (apiKeySource.value === 'none') {
+    return '未检测到 API Key：可在 backend/data/secrets.json 中填写 DEEPSEEK_API_KEY，或设置系统环境变量 DEEPSEEK_API_KEY，然后重启后端。'
+  }
+  return 'API Key 已配置但未能生效，请查看后端日志确认原因。'
+})
+
+// 侧边栏徽标与真实模型一致，不再写死 DeepSeek
+const engineLabel = computed(() => (demoMode.value ? 'Demo' : modelName.value || 'LLM'))
+const engineClass = computed(() => {
+  if (demoMode.value) return 'demo'
+  return modelName.value.toLowerCase().includes('deepseek') ? 'deepseek' : 'llm'
+})
 
 const qaSuggestions = [
   '这个项目是做什么的？',
@@ -46,11 +65,7 @@ function useSuggestion(q: string) {
   askQuestion()
 }
 
-interface WorkflowStep {
-  html: string
-}
-
-function formatDeveloperWorkflow(text: string): WorkflowStep[] {
+function formatDeveloperWorkflow(text: string): { html: string }[] {
   if (!text) return []
 
   const normalized = text.replace(/\r\n/g, '\n').trim()
@@ -167,6 +182,8 @@ async function checkHealth() {
     const data = await res.json()
     backendStatus.value = 'ok'
     demoMode.value = data.demo_mode === true
+    apiKeySource.value = data.api_key_source ?? 'none'
+    modelName.value = data.model ?? ''
   } catch {
     backendStatus.value = 'error'
   }
@@ -213,6 +230,10 @@ async function askQuestion() {
       return
     }
     qaHistory.value.push({ question: q, answer: data.answer })
+    // 后端回退到规则回答时会带上原因，这里如实提示，不再静默
+    if (data.source === 'fallback' && data.llm_error) {
+      qaError.value = `本次回答由规则生成：${data.llm_error}`
+    }
     qaQuestion.value = ''
   } catch (e: any) {
     qaError.value = e.message || 'Network error'
@@ -253,7 +274,10 @@ onMounted(checkHealth)
           </button>
         </div>
         <div v-if="demoMode" class="demo-notice">
-          Demo 模式：未配置 DEEPSEEK_API_KEY，分析结果基于规则生成。配置后可使用 LLM 分析。
+          Demo 模式：分析结果由规则生成，助手回答不含 LLM。{{ demoReason }}
+        </div>
+        <div v-else-if="result && result.llm_error" class="demo-notice fallback">
+          LLM 调用失败，本次结果已自动回退到规则分析：{{ result.llm_error }}
         </div>
         <div v-if="errorMsg" class="error-notice">{{ errorMsg }}</div>
       </div>
@@ -352,8 +376,7 @@ onMounted(checkHealth)
       <div class="sidebar">
         <div class="sidebar-title">{{ result.project_name }}</div>
         <div class="sidebar-url">{{ result.repo_url }}</div>
-        <span v-if="demoMode" class="sidebar-badge demo">Demo</span>
-        <span v-else class="sidebar-badge deepseek">DeepSeek</span>
+        <span class="sidebar-badge" :class="engineClass">{{ engineLabel }}</span>
 
         <!-- About -->
         <div v-if="result.overview" class="sidebar-block">

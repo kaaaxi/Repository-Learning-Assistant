@@ -5,11 +5,20 @@ services:
     ports:
       - "8000:8000"
     environment:
+      # 方式一（推荐给 Docker）：在宿主机设置 DEEPSEEK_API_KEY，
+      # 或用 `docker compose --env-file backend/.env up` 显式传入。
       DEEPSEEK_API_KEY: ${DEEPSEEK_API_KEY:-}
       DEEPSEEK_BASE_URL: ${DEEPSEEK_BASE_URL:-https://api.deepseek.com}
-      DEEPSEEK_MODEL: ${DEEPSEEK_MODEL:-deepseek-v4-pro}
+      # 可用模型名以服务端为准：deepseek-flash / deepseek-v4-pro
+      DEEPSEEK_MODEL: ${DEEPSEEK_MODEL:-deepseek-flash}
+      ANALYSIS_CACHE_TTL: ${ANALYSIS_CACHE_TTL:-86400}
+      ALLOWED_ORIGINS: ${ALLOWED_ORIGINS:-http://localhost:5173,http://127.0.0.1:5173}
+      # 方式二：把本机密钥文件挂进容器（默认路径 /app/data/secrets.json 已可用）
+      REPOASSISTANT_SECRETS_FILE: /app/data/secrets.json
     volumes:
-      - backend-data:/app/data
+      # 本机 backend/data 与容器共享：密钥文件和 Git 缓存（clone 结果）都持久化在磁盘上，
+      # 不再使用匿名卷，避免"重启后所有仓库都要重新克隆"。
+      - ./backend/data:/app/data
 
   frontend:
     build:
@@ -18,6 +27,3 @@ services:
       - "5173:5173"
     depends_on:
       - backend
-
-volumes:
-  backend-data:

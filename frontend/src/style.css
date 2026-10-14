@@ -457,10 +457,24 @@ body {
   border: 1px solid #54aeff;
 }
 
+/* 非 DeepSeek 的 OpenAI 兼容模型：用中性色徽标，避免显示成 DeepSeek */
+.sidebar-badge.llm {
+  background: #f3f0ff;
+  color: #6639ba;
+  border: 1px solid #b39ddb;
+}
+
 .sidebar-badge.demo {
   background: #fff8c5;
   color: #7a5e00;
   border: 1px solid #e3b341;
+}
+
+/* LLM 调用失败后的回退提示：用橙色与"未配置密钥"的黄色区分 */
+.demo-notice.fallback {
+  background: #fff1e5;
+  border-color: #d4802a;
+  color: #8a4600;
 }
 
 /* Sidebar blocks */

@@ -5,12 +5,13 @@ __pycache__/
 .venv/
 venv/
 
-# Backend data
-backend/data/repos/
-backend/data/analyses/
+# Backend data（含密钥文件 secrets.json，绝不提交）
+backend/data/
 
 # Environment
 backend/.env
+.env
+.env.local
 
 # Node
 node_modules/
