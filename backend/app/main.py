@@ -1,9 +1,12 @@
 import logging
+import os
+import sys
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.config import (
+    AGENT_NUDGE_ENABLED,
     ALLOWED_ORIGINS,
     API_KEY_SOURCE,
     DEEPSEEK_MODEL,
@@ -12,6 +15,16 @@ from app.config import (
 )
 from app.models import AnalyzeRequest, AnalysisResult, ChatRequest, ChatResponse, HealthResponse
 from app.services import agent_service, analysis_service, llm_service, repo_service, storage_service
+
+# 让 repoassistant.* 的日志打到控制台：默认 INFO，便于人工观察 Agent 的探索过程
+# （Agent 每一步的轨迹、失败原因都在这条日志里）。用 LOG_LEVEL 可调成 WARNING/DEBUG。
+_APP_LOGGER = logging.getLogger("repoassistant")
+if not _APP_LOGGER.handlers:
+    _APP_LOGGER.setLevel(os.getenv("LOG_LEVEL", "INFO").upper())
+    _handler = logging.StreamHandler(sys.stdout)
+    _handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)-7s %(name)s | %(message)s", "%H:%M:%S"))
+    _APP_LOGGER.addHandler(_handler)
+    _APP_LOGGER.propagate = False          # 避免 uvicorn 的 root logger 再打一遍（重复行）
 
 logger = logging.getLogger("repoassistant.api")
 
@@ -78,10 +91,13 @@ def chat(req: ChatRequest):
     if use_agent:
         outcome = agent_service.ask_repository(analysis, req.question)
         if outcome.answer is not None:
+            # 纠偏关闭时不打印该字段——关掉的机制不该在日志里留噪音
+            nudge_part = f" 纠偏={outcome.nudges}" if AGENT_NUDGE_ENABLED else ""
             logger.info(
-                "Agent 问答完成：steps=%s stop=%s finished_by=%s 证据=%s 自报依据=%s 轨迹=%s",
-                outcome.steps, outcome.stop_reason, outcome.finished_by, outcome.citations,
-                outcome.claimed_evidence, outcome.trace_text(),
+                "Agent 问答完成：steps=%s stop=%s finished_by=%s 实现文件=%s%s 证据=%s 自报依据=%s 轨迹=%s",
+                outcome.steps, outcome.stop_reason, outcome.finished_by,
+                outcome.implementation_files_read, nudge_part,
+                outcome.citations, outcome.claimed_evidence, outcome.trace_text(),
             )
             return {
                 "answer": outcome.answer,

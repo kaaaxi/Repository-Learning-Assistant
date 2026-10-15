@@ -23,9 +23,25 @@ SECRETS_FILE = Path(os.getenv("REPOASSISTANT_SECRETS_FILE") or DEFAULT_SECRETS_F
 ANALYSIS_CACHE_TTL = int(os.getenv("ANALYSIS_CACHE_TTL", str(24 * 60 * 60)))
 
 # Agent 问答的循环上限（对应 docs/AGENT-STAGE0.md 第 9 节的停止标准）。
-AGENT_MAX_STEPS = int(os.getenv("AGENT_MAX_STEPS", "8"))              # 单次问答最多调用多少次工具
+# 实测：中等仓库（pallets/click）一个"跨多文件"的问题，12 步仍会被用满且没读到实现，
+# 因此默认设为 25。注意另外两个相邻约束（按实测每步约 2.6 秒 / 2000 字符估算）：
+#   AGENT_TIMEOUT_SECONDS=90  -> 约 35 步
+#   AGENT_CONTEXT_BUDGET=60000 字符 -> 约 30 步
+# 也就是说 25 步刚好卡在两者之内；若继续调大步数，应同步调大这两个上限，
+# 否则会先撞上"上下文预算截断"或"总时长超时"。
+AGENT_MAX_STEPS = int(os.getenv("AGENT_MAX_STEPS", "25"))             # 单次问答最多调用多少次工具
 AGENT_TIMEOUT_SECONDS = float(os.getenv("AGENT_TIMEOUT_SECONDS", "90"))  # 单次问答的墙钟时间上限
 AGENT_CONTEXT_BUDGET = int(os.getenv("AGENT_CONTEXT_BUDGET", "60000"))   # 回喂给模型的工具结果总字符预算
+# 中途纠偏开关（默认**关闭**）：连续多步只读文档/测试时，注入一条"去读实现文件"的提示。
+#
+# 为什么默认关闭：对照实验（同一个问题、同一份代码、真实 click 仓库）显示它没有可测量的收益——
+#   关闭纠偏：19 步 / 42 秒 / 自然收尾 / 读了 3 个实现文件（脚本内 6 次读实现）
+#   开启纠偏：18 步 / 38 秒 / 自然收尾 / 读了 2 个实现文件（脚本内 5 次读实现）
+#   两次注入里只有 1 次紧接着变成了读实现；而"读到实现 + 自然收尾"在纠偏为 0 时同样发生。
+# 真正决定质量的是工具层修复（core.py 从"不可见"变成可读），不是这条提醒。
+# 保留它的价值：遇到"整轮只在文档里打转"的极端轨迹时给一次纠正机会，且日志里的 纠偏=N 可当探针。
+# 需要时设 AGENT_NUDGE_ENABLED=1 打开。
+AGENT_NUDGE_ENABLED = os.getenv("AGENT_NUDGE_ENABLED", "0").strip().lower() in {"1", "true", "yes"}
 
 _DEFAULT_ALLOWED_ORIGINS = "http://localhost:5173,http://127.0.0.1:5173,http://localhost:4173,http://127.0.0.1:4173"
 

@@ -117,6 +117,16 @@ def main() -> int:
         len([l for l in repo_tools.search_code(fixture, "def", max_hits=1).splitlines() if ":" in l]) == 1,
         repo_tools.search_code(fixture, "def", max_hits=1)[:120])
 
+    # 关键词被误当正则时的纠正回路（实测真实模型会写 "autofunction|autoclass"）
+    pipe_result = repo_tools.search_code(fixture, "autofunction|autoclass")
+    rec("带正则符号且零命中时明确指出不支持正则",
+        "字面匹配" in pipe_result and "不支持正则" in pipe_result, pipe_result[:150])
+    rec("纠正提示里给了替代做法（拆成单个关键词）", "拆成单个关键词" in pipe_result, "")
+    rec("带正则符号但确有命中时不误报",
+        "不支持正则" not in repo_tools.search_code(fixture, "chat(question)"), "")
+    rec("普通关键词零命中时仍是原来的建议",
+        "不支持正则" not in repo_tools.search_code(fixture, "绝对不存在的符号xyz"), "")
+
     print("=== 3. read_file ===")
     body = repo_tools.read_file(fixture, "backend/app/main.py")
     rec("带行号返回", "     1  import logging" in body or "1  import logging" in body, body[:120])
@@ -150,10 +160,55 @@ def main() -> int:
     expect_error("绝对路径被拒", lambda: repo_tools.read_file(fixture, "C:/Windows/win.ini"), "相对路径")
     expect_error("不存在的文件给出提示", lambda: repo_tools.read_file(fixture, "nope.py"), "文件不存在")
     expect_error("目录不能当文件读", lambda: repo_tools.read_file(fixture, "backend"), "是目录")
-    expect_error("超大文件被拒并建议搜索", lambda: repo_tools.read_file(fixture, "big.py"), "文件过大")
+    expect_error("超大文件整读被拒并建议分段", lambda: repo_tools.read_file(fixture, "big.py"), "整读上限")
     expect_error("非文本文件被跳过", lambda: repo_tools.read_file(fixture, "logo.png"), "不是文本文件")
     expect_error("空关键字被拒", lambda: repo_tools.search_code(fixture, "  "), "不能为空")
     expect_error("非法行范围被拒", lambda: repo_tools.read_file(fixture, "backend/app/main.py", start=5, end=2), "不合法")
+
+    print("=== 4c. 大文件：范围读必须可用，整读才受限 ===")
+    big_mid = fixture / "mid_big.py"
+    try:
+        # 介于"整读上限"与"硬上限"之间的文件（约 150 KB）：真实案例里 click 的 core.py 就是这样
+        big_mid.write_text("x = 1\n" * 25_000, encoding="utf-8")
+        ranged = repo_tools.read_file(fixture, "mid_big.py", start=10, end=12)
+        rec("超大文件的范围读可用（不再一刀切拒绝）",
+            "第 10-12 行" in ranged and ranged.count("x = 1") == 3, ranged[:80])
+        rec("范围读带行号（右对齐到 5 位）", "   11  x = 1" in ranged, repr(ranged[:120]))
+        try:
+            repo_tools.read_file(fixture, "mid_big.py")
+            rec("整读超大文件被拒", False, "竟然成功了")
+        except repo_tools.ToolError as e:
+            rec("整读超大文件被拒，且说明是整读上限", "整读上限" in str(e), str(e)[:100])
+            rec("拒绝时明确告知范围读不受限制", "范围读不受大小限制" in str(e), str(e)[:100])
+        # 搜索必须能扫到这类大文件（否则大文件里的符号永远搜不到）
+        hits = repo_tools.search_code(fixture, "x = 1", glob="mid_big.py", max_hits=3)
+        rec("搜索能扫到超过整读上限的大文件", "mid_big.py:" in hits, hits[:100])
+    finally:
+        big_mid.unlink(missing_ok=True)
+
+    print("=== 4d. glob 写法的兼容性 ===")
+    for rel, g, want in [("src/click/core.py", "src/click/core.py", True),
+                         ("src/click/core.py", "core.py", True),
+                         ("src/click/core.py", "*core.py", True),
+                         ("src/click/core.py", "src/**/*.py", True),
+                         ("src/click/core.py", "*.md", False),
+                         ("src/click/core.py", "", True)]:
+        got = repo_tools._path_matches(rel, g)
+        rec(f"glob {g!r:20} 匹配 {rel} → {want}", got == want, f"实际 {got}")
+
+    print("=== 4b. 读取路径分类（用于中途纠偏判断）===")
+    from app.services import agent_service as _agent
+    for rel, want in [("src/click/decorators.py", "implementation"),
+                      ("app/services/repo_tools.py", "implementation"),
+                      ("src/click/__init__.py", "export"),
+                      ("tests/test_imports.py", "test"),
+                      ("docs/api.md", "docs"),
+                      ("CHANGES.md", "docs"),
+                      ("CONTRIBUTING.md", "docs"),
+                      ("pyproject.toml", "config"),
+                      ("", "other")]:
+        got = _agent._classify_read(rel)
+        rec(f"分类 {rel or '(空)'} → {want}", got == want, f"实际 {got}")
 
     print("=== 5. 工具注册表与调用入口 ===")
     rec("声明集与可执行集分离且都符合预期",

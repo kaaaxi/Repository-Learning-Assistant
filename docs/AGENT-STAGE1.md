@@ -105,8 +105,8 @@ python tests/test_logic.py         # 原有逻辑 69 项
 | 测试 | 断言数 | 状态 |
 |---|---|---|
 | test_logic.py | 83 | ✅ 全绿 |
-| test_agent_tools.py | 46 | ✅ 全绿 |
-| test_agent_loop.py | 49 | ✅ 全绿 |
+| test_agent_tools.py | 70 | ✅ 全绿 |
+| test_agent_loop.py | 68 | ✅ 全绿 |
 | test_e2e.py | 45 | ✅ 全绿（真实 openai 3.31.0 + 真实 DeepSeek） |
 
 **真实模型跑出来的 Agent 轨迹**（`deepseek-flash`，问题："`search_code` 定义在哪个文件？又被哪些文件调用？"）：
@@ -151,8 +151,39 @@ evidence=['backend/app/services/search_service.py', 'backend/app/main.py', 'back
     - **客户端复用**：`_client()` 按 `(api_key, base_url, timeout, max_retries)` 签名记忆化，同配置返回同一个 `OpenAI` 实例（复用连接池），配置变化时自动重建。原因是一轮 Agent 问答要调用模型 5~9 次，每次新建客户端等于重复创建连接池；SDK 官方也要求复用 client。
     - **分层的价值在这次迁移里得到验证**：从 httpx 换成 SDK 只改了 `llm_service.py`、`config.py`、`requirements.txt` 三个文件，`agent_service.py` 与 `repo_tools.py` 一行未动——Agent 循环只管"何时调、调完干什么"，传输层的事（base_url 归一、超时、重试、异常分类）全部留在 `llm_service`。
 
-## 8. Stage 1 刻意没做（留给后续）
+## 7b. 三个工具层缺陷与一次对照实验（真实仓库验证）
 
+在 pallets/click 上反复测试时暴露了三个工具层缺陷，修复后 Agent 表现有质变。**结论：质量变化的根因是工具层能力，不是提示词。**
+
+**缺陷 1：大文件对 Agent 完全不可见（最严重）**
+`MAX_TEXT_FILE_SIZE`（100 KB）被同时用在两处——`read_file` 的范围读、`search_code` 的扫描上限。click 的 `core.py` 是 161 KB，于是**既搜不到也读不了**，而它正是 `Command`/`Option`/`Parameter` 等核心类的定义处。观察到的现象是模型反复搜 `class Option` 却永远零命中，只能给出"按职责选择文件"这类从文件名推断的答案。
+修复：拆成三个上限——整读上限（100 KB，只拦不带范围的读）、搜索扫描上限（5 MB）、硬上限（5 MB）；范围读不再受整读上限约束。错误提示也从"请改用 search_code"改成"先用 search_code 定位行号，再用 read_file(rel_path, start, end) 按范围读——按范围读不受大小限制"。
+
+**缺陷 2：`glob` 传完整相对路径匹配不上**
+`Path("src/click/core.py").match("src/click/core.py")` 返回 **False**（`match` 从右往左按段匹配，模式段数不能超过路径段数）。模型很自然地传完整相对路径，结果零命中且无从得知原因。修复：新增 `_path_matches()`，同时接受通配模式、完整相对路径、纯文件名。
+
+**缺陷 3：提示词约束不到位（收益有限）**
+在提示词里加了"优先读实现文件、顺 import 追实现、打开就把它读完"，并新增中途纠偏机制（连续多步没读实现时注入系统提示）。
+
+**对照实验：纠偏（nudge）无效，默认关闭（`AGENT_NUDGE_ENABLED=0`）**
+同一个问题（"两个重名参数会怎样"）、同一份代码、真实 click 仓库：
+
+| 运行 | 纠偏次数 | 步数 | 耗时 | 结束方式 | 轨迹中读实现文件的次数 |
+|---|---|---|---|---|---|
+| 关闭纠偏 | 0 | 19 | 42s | 自然收尾 | 6 / 19 步（3 个实现文件） |
+| 开启纠偏 | 2 | 18 | 38s | 自然收尾 | 5 / 18 步（2 个实现文件） |
+
+两次注入里只有 1 次紧接着变成了读实现（另一次紧接着仍是搜索）。而"读到实现 + 自然收尾"在纠偏为 0 时照样发生。**因此它没有可测量的收益**，按"无法证明有效的机制不默认启用"处理，但保留代码与日志探针（`纠偏=N`），需要时用 `AGENT_NUDGE_ENABLED=1` 打开。
+
+**修复后 Agent 在三类问题上的实测（答案均已逐条核对源码）**
+
+| 问题 | 步数 | 结束方式 | 核对结果 |
+|---|---|---|---|
+| `Command.parse_args` 怎么实现 | 12 | 自然收尾 | 行号全对 |
+| 加新公开接口要改哪些文件 | 18 | 自然收尾 | 行号全对，且区分"改库 API"与"给自建 CLI 加子命令" |
+| 两个重名参数会怎样 | 22 | 自然收尾 | 警告文案、`__debug__` 前提、feature switch 合法性、`TypeError` 场景全部准确，含"官方 docstring 重复粘贴"这类细节 |
+
+## 8. Stage 1 刻意没做（留给后续）
 - ❌ 不做代码修改/打补丁，不运行被测项目的测试（仍只"看"）；
 - ❌ 不做跨仓库检索、不读 Issues/PR、不联网；
 - ❌ 不引入 embedding / 向量索引（先用关键词搜索证明必要性）；

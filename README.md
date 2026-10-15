@@ -75,9 +75,10 @@ DEEPSEEK_MODEL=deepseek-flash
 | `ALLOWED_ORIGINS` | `localhost` / `127.0.0.1` 的 5173、4173 | 允许跨域访问后端的前端来源 |
 | `REPOASSISTANT_SECRETS_FILE` | `backend/data/secrets.json` | 密钥文件路径 |
 | `REPOASSISTANT_DATA_DIR` | `backend/data` | 运行时数据根目录（仓库缓存与分析结果） |
-| `AGENT_MAX_STEPS` | `8` | Agent 问答单次最多执行多少次工具调用 |
+| `AGENT_MAX_STEPS` | `25` | Agent 问答单次最多执行多少次工具调用 |
 | `AGENT_TIMEOUT_SECONDS` | `90` | Agent 问答单次墙钟时间上限 |
 | `AGENT_CONTEXT_BUDGET` | `60000` | 回喂给模型的工具结果总字符预算 |
+| `AGENT_NUDGE_ENABLED` | `0` | 中途纠偏（连续多步只读文档时提醒去读实现）。对照实验未测出收益，默认关闭 |
 
 `DEEPSEEK_BASE_URL` 填 `https://api.deepseek.com` 或 `https://api.deepseek.com/v1` 都可以，后端会自动补全 `/v1/chat/completions`，不会再出现 `/v1/v1`。
 
@@ -172,9 +173,9 @@ npm run dev
 
 | 脚本 | 断言数 | 依赖 | 说明 |
 |---|---|---|---|
-| `test_logic.py` | 77 | 无（自带替身） | 配置/密钥、目录树解析、缓存、校验、路径穿越、SDK 错误分类 |
-| `test_agent_tools.py` | 46 | 无 | 三个只读工具的真实文件操作与安全边界、注册表一致性 |
-| `test_agent_loop.py` | 49 | 无 | Agent 循环：多轮探索、工具回喂、finish 结束、步数/超时/重复/报错处理 |
+| `test_logic.py` | 83 | 无（自带替身） | 配置/密钥、目录树解析、缓存、校验、路径穿越、SDK 错误分类 |
+| `test_agent_tools.py` | 70 | 无 | 三个只读工具的真实文件操作与安全边界、大文件范围读、glob 写法兼容、注册表一致性 |
+| `test_agent_loop.py` | 68 | 无 | Agent 循环：多轮探索、工具回喂、finish 结束、步数/超时/重复/报错处理、中途纠偏 |
 | `test_e2e.py` | 45 | 真实依赖 | 真实 HTTP 接口 + 真实规则/LLM 分析 + 真实 Agent 工具调用 |
 
 ```bash

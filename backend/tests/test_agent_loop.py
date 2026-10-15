@@ -206,6 +206,105 @@ def main() -> int:
         rec("system 提示里说明了工具与上限",
             "search_code" in first_call_messages[0]["content"] and "工具调用" in first_call_messages[0]["content"], "")
 
+        print("=== 2b. 系统提示词里的关键约束（改进项 ①②）===")
+        system_text = first_call_messages[0]["content"]
+        rec("说明搜索是字面匹配、不支持正则",
+            "字面匹配" in system_text and "不支持正则" in system_text, "")
+        rec("工具清单里也标注了这一点", "不是正则" in system_text, "")
+        rec("要求优先读实现文件（顺 import 追实现）",
+            "优先读实现文件" in system_text and "import" in system_text, "")
+        rec("要求不要反复列目录",
+            "不要为每个目录都列一遍" in system_text, "")
+        rec("提醒接近预算时宁可交代缺口",
+            "还缺什么证据" in system_text, "")
+        rec("要求打开实现文件就把它读完（改进项①）",
+            "打开一个实现文件就把它读完" in system_text and "不要只读中段就换目标" in system_text, "")
+        rec("预算数字来自配置（当前默认 25 次）",
+            f"最多 {agent_service.AGENT_MAX_STEPS} 次探索工具调用" in system_text,
+            f"AGENT_MAX_STEPS={agent_service.AGENT_MAX_STEPS}")
+
+        print("=== 2c. 中途纠偏（默认关闭，可通过 AGENT_NUDGE_ENABLED=1 打开）===")
+        rec("纠偏默认关闭（对照实验证明无可测量收益）",
+            agent_service.AGENT_NUDGE_ENABLED is False, f"实际 {agent_service.AGENT_NUDGE_ENABLED}")
+        nudge_record: dict = {}
+
+        # 下面的用例直接测机制本身：临时打开开关，跑完恢复
+        agent_service.AGENT_NUDGE_ENABLED = True
+
+        def doc_then_impl(messages, tools=None, temperature=0.3):
+            nudge_record["messages"] = json.loads(json.dumps(messages))
+            if not tools:
+                return _final_answer("收尾回答"), None
+            outputs = _tool_messages(messages)
+            impl_hint = any("打开过的实现文件" in m.get("content", "") or "把它读完" in m.get("content", "")
+                            for m in messages if m.get("role") == "user")
+            if impl_hint and not any("app/main.py" in o for o in outputs):
+                return _tool_call("read_file", {"rel_path": "backend/app/main.py"}, "c_impl"), None
+            if not outputs:
+                # 第一步读文档（不是实现文件）——这才是"只读文档"的真实形态
+                return _tool_call("read_file", {"rel_path": "docs/guide.md"}, "c0"), None
+            if len(outputs) < 6:                      # 接着几轮都在做非实现的探索
+                return _tool_call("search_code", {"keyword": f"kw{len(outputs)}"}, f"c{len(outputs)}"), None
+            return _tool_call("finish", {"answer": "最终答案"}, "c_fin"), None
+
+        llm_service.request_chat_completion = doc_then_impl
+        result = agent_service.run_agent_chat(ANALYSIS, fixture, "只看文档会怎样")
+        rec("一直不读实现时触发了纠偏", result.nudges == 1, f"nudges={result.nudges}")
+        rec("纠偏后模型确实去读了实现文件",
+            result.implementation_files_read == ["backend/app/main.py"], str(result.implementation_files_read))
+        rec("纠偏次数上限为 1（不会反复打断）", result.nudges <= 1, str(result.nudges))
+        nudge_texts = [m.get("content", "") for m in nudge_record["messages"]
+                       if m.get("role") == "user" and "系统提示" in m.get("content", "")]
+        rec("纠偏消息出现在对话里", bool(nudge_texts), str(nudge_texts)[:120])
+        rec("纠偏消息点明该回到哪个文件（引用已打开过的文件）",
+            bool(nudge_texts) and "docs/guide.md" in nudge_texts[-1], str(nudge_texts)[-1][:160] if nudge_texts else "")
+
+        # 一上来就读实现：不该被纠偏打扰
+        def impl_first(messages, tools=None, temperature=0.3):
+            if not tools:
+                return _final_answer("收尾"), None
+            if not _tool_messages(messages):
+                return _tool_call("read_file", {"rel_path": "backend/app/main.py"}, "c1"), None
+            return _tool_call("finish", {"answer": "答案"}, "cf"), None
+
+        llm_service.request_chat_completion = impl_first
+        result = agent_service.run_agent_chat(ANALYSIS, fixture, "先读实现")
+        rec("已读实现文件时不触发纠偏", result.nudges == 0, f"nudges={result.nudges}")
+        rec("实现文件被登记", result.implementation_files_read == ["backend/app/main.py"], str(result.implementation_files_read))
+
+        # 读过一个入口（__init__.py）之后就漂走：也要能被纠正
+        def export_then_drift(messages, tools=None, temperature=0.3):
+            if not tools:
+                return _final_answer("收尾"), None
+            outputs = _tool_messages(messages)
+            if not outputs:
+                return _tool_call("read_file", {"rel_path": "backend/app/__init__.py"}, "c0"), None
+            if any("把它读完" in m.get("content", "") for m in messages if m.get("role") == "user") \
+                    and not any("app/main.py" in o for o in outputs):
+                return _tool_call("read_file", {"rel_path": "backend/app/main.py"}, "c_impl"), None
+            if len(outputs) < 8:
+                return _tool_call("list_directory", {"rel_path": f"d{len(outputs)}"}, f"c{len(outputs)}"), None
+            return _tool_call("finish", {"answer": "答案"}, "cf"), None
+
+        llm_service.request_chat_completion = export_then_drift
+        result = agent_service.run_agent_chat(ANALYSIS, fixture, "读完入口就漂走")
+        rec("读过 __init__.py 后漂走仍会被纠偏", result.nudges >= 1, f"nudges={result.nudges}")
+        rec("纠偏后被引导去读了实现文件",
+            result.implementation_files_read == ["backend/app/main.py"], str(result.implementation_files_read))
+
+        # 一直不读实现：纠偏次数要有上限，不能每步都打断
+        llm_service.request_chat_completion = _varying_tool("list_directory", "d{n}")
+        result = agent_service.run_agent_chat(ANALYSIS, fixture, "永远不读实现")
+        rec("纠偏次数不超过上限", result.nudges <= agent_service._NUDGE_MAX_TIMES,
+            f"nudges={result.nudges} 上限={agent_service._NUDGE_MAX_TIMES}")
+
+        agent_service.AGENT_NUDGE_ENABLED = False      # 恢复默认（关闭）
+
+        # 关闭时不应再注入任何提示
+        llm_service.request_chat_completion = _varying_tool("list_directory", "d{n}")
+        result = agent_service.run_agent_chat(ANALYSIS, fixture, "关闭纠偏后不该被打断")
+        rec("关闭后不再注入纠偏", result.nudges == 0, f"nudges={result.nudges}")
+
         print("=== 3. 步数上限：停下并如实报告 ===")
         agent_service.AGENT_MAX_STEPS = 2
         llm_service.request_chat_completion = _varying_tool("read_file", "backend/app/main.py?n={n}")  # 每轮参数不同

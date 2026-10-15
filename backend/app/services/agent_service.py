@@ -20,6 +20,7 @@ from pathlib import Path
 from app.config import (
     AGENT_CONTEXT_BUDGET,
     AGENT_MAX_STEPS,
+    AGENT_NUDGE_ENABLED,
     AGENT_TIMEOUT_SECONDS,
     DEMO_MODE,
     REPOS_DIR,
@@ -44,6 +45,13 @@ FINISH_FORCED = "forced_conclusion"
 # 模型调用失败时的同轮重试次数（应对偶发的 SSL EOF / 超时）
 LLM_RETRY_LIMIT = 1
 
+# 中途纠偏：用掉少量步数后、最近 N 步都没读实现文件时，注入系统提示。
+# 这里刻意**不按 AGENT_MAX_STEPS 的比例**计算：漂移在开头几步就会发生，
+# 按比例算会让触发点随预算一起后移（实测 25 步时触发点被推到 12 步，等于失效）。
+_NUDGE_WINDOW = 3
+_NUDGE_MIN_STEPS = 5          # 至少先走 5 步再打断
+_NUDGE_MAX_TIMES = 2          # 最多打断两次，避免变成噪音
+
 
 @dataclass
 class AgentTraceStep:
@@ -64,6 +72,8 @@ class AgentResult:
     finished_by: str | None = None      # finish_tool / content / forced_conclusion
     error: str | None = None
     elapsed: float = 0.0
+    implementation_files_read: list[str] = field(default_factory=list)   # 读过的实现文件（用于观测"是否读到实质"）
+    nudges: int = 0                                                      # 中途纠偏触发次数
 
     @property
     def ok(self) -> bool:
@@ -83,17 +93,27 @@ SYSTEM_PROMPT_TEMPLATE = """\
 - 本地根目录：{repo_root}（所有工具路径都相对这个目录）
 {tree_excerpt}
 ## 你的工具（只读，不能修改仓库、不能联网）
-- `search_code(keyword, glob?, max_hits?)`：按关键字/符号搜索，返回 `文件:行号` 与命中行
+- `search_code(keyword, glob?, max_hits?)`：按关键字搜索，返回 `文件:行号` 与命中行。**keyword 是字面匹配，不是正则**：一次只搜一个词，不要用 `|` 连接多个词
 - `read_file(rel_path, start?, end?)`：读取文件（带行号），建议先用搜索定位再读片段
-- `list_directory(rel_path)`：查看目录结构
+- `list_directory(rel_path)`：查看目录结构（知道路径时可直接 read_file，不必先列目录）
 - `finish(answer, evidence?)`：**结束本轮并给出最终答案**（不消耗探索步数）
 
 ## 工作方式
 1. 需要看代码时**必须调用工具**，不要凭记忆或猜测回答；
 2. 按需多轮探索：先搜索定位，再读文件；读到调用关系后可以继续追下一个文件；
-3. **结束时必须调用 `finish`**：把最终答案放进 `answer`，并用 `evidence` 列出你依据的文件路径；
+3. **优先读实现文件，把预算用在答案所在的地方**：
+   - **实现文件 = 提供功能的源码**（如 `src/<pkg>/*.py`）；**测试、变更日志（CHANGES）、贡献指南（CONTRIBUTING）、`docs/` 下的文档都不算实现文件**；
+   - 先看包的入口（如 `src/<pkg>/__init__.py`）找出公共 API，再**顺着它的 import 语句**去读真正的实现模块，而不是停在文件名上；
+   - **打开一个实现文件就把它读完**：`read_file` 不给范围（默认 120 行）或分段读到文件末尾；**不要只读中段就换目标**——同一文件的其他行往往就是答案（例如参数装饰器的定义就在 `decorators.py` 开头）。读完一个再去看下一个；
+   - **除非用户明确问到文档/贡献流程/变更日志，否则不要用 >2 步去看这些内容**；它们的约定可以用一两步扫过，但不要挤掉读实现的时间；
+   - `list_directory` 只在不知道目录结构时用，**不要为每个目录都列一遍**；已经知道文件路径就直接 `read_file`；
+4. `search_code` 的关键词是**字面匹配**，不支持正则：一次只搜一个词或符号，多个词请分多次调用；
+   也不要搜索"自己已经知道的文件名"（例如刚读过 `docs/api.md` 又去搜 `api.md`），那是无效搜索；
+5. **结束时必须调用 `finish`**：把最终答案放进 `answer`，并用 `evidence` 列出你依据的文件路径；
    不要只在正文里写答案而不调用 finish——那样这轮会被判定为"没有回答"；
-4. 预算：最多 {max_steps} 次探索工具调用（finish 不计入）、总时长 {timeout} 秒。
+6. 预算：最多 {max_steps} 次探索工具调用（finish 不计入）、总时长 {timeout} 秒。
+   用掉约一半预算后自查一次：**如果还没读过任何实现文件，下一步必须去读实现**；
+   接近预算时，宁可先给出"已确认的结论 + 还缺什么证据"，也不要在没读实现的情况下凭文件名推断。
 
 ## 回答要求
 - 只依据你实际读到的代码作答，给出**文件路径 + 行号或函数名**作为依据；
@@ -183,6 +203,51 @@ def _merge_citations(trace: list[AgentTraceStep], claimed: list[str]) -> list[st
         if cleaned and cleaned not in seen:
             seen.append(cleaned)
     return seen
+
+
+_DOC_DIRS = {"docs", "doc", "documentation"}
+_TEST_DIRS = {"tests", "test", "testing"}
+
+
+def _classify_read(rel_path: str) -> str:
+    """把一次 read_file 的路径分类：实现 / 包入口 / 文档 / 测试 / 配置 / 其它。
+
+    只用于统计与"中途纠偏"判断，不参与安全或功能逻辑。
+    注意 `__init__.py` 单独归为 "export"：它通常只是重导出清单，
+    **不代表已经读过真正的实现**（实测模型读完它就以为"读过实现了"）。
+    """
+    rel = str(rel_path or "").strip().lstrip("./").replace("\\", "/")
+    if not rel:
+        return "other"
+    parts = [p for p in rel.split("/") if p]
+    if not parts:
+        return "other"
+    if parts[0] in _DOC_DIRS:
+        return "docs"
+    if parts[0] in _TEST_DIRS:
+        return "test"
+    name = parts[-1].lower()
+    if name == "__init__.py":
+        return "export"
+    if name.endswith(".py"):
+        return "implementation"
+    if name.startswith(("readme", "changes", "changelog", "contributing", "license")):
+        return "docs"
+    if name in {"pyproject.toml", "setup.py", "setup.cfg", "tox.ini", "requirements.txt"}:
+        return "config"
+    return "other"
+
+
+def _nudge_message(used: int, limit: int, result: AgentResult) -> str:
+    """最近几步没读实现文件时，给出的确定性纠偏提示。"""
+    last_impl = [s.arguments.get("rel_path") for s in result.trace if s.tool == "read_file"]
+    opened = [p for p in last_impl if p] or ["你之前打开过的实现文件"]
+    return (
+        f"（系统提示：你已用 {used}/{limit} 步，但最近 {_NUDGE_WINDOW} 步都没有读实现文件。"
+        f"请不要再看文档、测试、变更日志或列目录——回到 {opened[-1]!r} 把它读完"
+        "（read_file 不带范围或接着上次的 end 继续），再读顺着它 import 到的实现模块。"
+        "如果确实无法确认，就用已经读到的证据收尾，并在答案里说明缺口。）"
+    )
 
 
 def _cap_output(output: str, used: int, budget: int) -> tuple[str, int]:
@@ -315,11 +380,37 @@ def run_agent_chat(analysis: dict, repo_root: Path, question: str) -> AgentResul
                 arguments=call["arguments"],
                 result_preview=" ".join(str(output).split())[:_TRACE_PREVIEW_CHARS],
             ))
+            # 统计读过的实现文件：既是可观测指标，也是"是否需要纠偏"的判断依据
+            if call["name"] == "read_file":
+                rel = str(call["arguments"].get("rel_path", ""))
+                if _classify_read(rel) == "implementation" and rel not in result.implementation_files_read:
+                    result.implementation_files_read.append(rel)
             messages.append({
                 "role": "tool",
                 "tool_call_id": call["id"],
                 "content": fed_back,
             })
+
+        # 中途纠偏：走够少量步数、且最近若干步都没读实现文件 → 注入系统提示。
+        # 判据是"最近几步读了什么"（含 __init__.py 这类入口不算实现），
+        # 因此"开头读一个就漂走"也能被纠正；这是确定性机制，不依赖模型自觉。
+        if AGENT_NUDGE_ENABLED and not finishing:
+            if (result.steps >= _NUDGE_MIN_STEPS
+                    and result.nudges < _NUDGE_MAX_TIMES
+                    and len(result.trace) >= _NUDGE_MIN_STEPS):
+                recent = result.trace[-_NUDGE_WINDOW:]
+                read_kinds = [
+                    _classify_read(str(s.arguments.get("rel_path", "")))
+                    for s in recent if s.tool == "read_file"
+                ]
+                if "implementation" not in read_kinds:
+                    result.nudges += 1
+                    messages.append({"role": "user", "content": _nudge_message(result.steps, AGENT_MAX_STEPS, result)})
+                    llm_service.log_llm_error(
+                        "Agent 中途纠偏",
+                        f"已用 {result.steps}/{AGENT_MAX_STEPS} 步，最近 {_NUDGE_WINDOW} 步没读实现文件，"
+                        f"已注入提示（第 {result.nudges} 次）",
+                    )
 
         if finishing:
             # 模型显式声明结束：优先用 finish 的 answer；解析不出来就退回 content

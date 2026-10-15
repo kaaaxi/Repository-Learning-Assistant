@@ -14,9 +14,13 @@
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 from app.services import repo_service
+
+# 正则元字符：关键词里出现它们，说明模型误以为这是正则搜索
+_REGEX_META_RE = re.compile(r"[|*?+\[\]()\\^$]")
 
 # 目录列表
 MAX_LIST_ITEMS = 60
@@ -27,7 +31,12 @@ SNIPPET_MAX_CHARS = 160
 # 读取
 DEFAULT_READ_LINES = 120
 MAX_READ_LINES = 200
-MAX_TEXT_FILE_SIZE = repo_service.MAX_FILE_SIZE          # 100 KB，与目录树/配置抽取保持一致
+MAX_TEXT_FILE_SIZE = repo_service.MAX_FILE_SIZE          # 100 KB：只约束 read_file 的"整读"
+# 搜索时的扫描上限：必须明显大于整读上限，否则大文件（如 click 的 core.py，161 KB）
+# 根本不会被搜索到，模型只能反复搜同一个符号却永远零命中。
+SEARCH_MAX_FILE_SIZE = 5_000_000
+# 硬上限：连按范围读都拒绝的大小（防止误把超大文件一次读进内存）
+HARD_READ_BYTES = 5_000_000
 
 TEXT_SUFFIXES = {
     ".py", ".pyi", ".js", ".mjs", ".cjs", ".ts", ".tsx", ".jsx", ".vue", ".svelte",
@@ -105,11 +114,40 @@ def _is_probably_text(path: Path) -> bool:
     return False
 
 
-def _read_text(path: Path) -> str:
-    if path.stat().st_size > MAX_TEXT_FILE_SIZE:
-        raise ToolError(
-            f"文件过大（{path.stat().st_size} 字节 > {MAX_TEXT_FILE_SIZE}），请改用 search_code 定位片段"
-        )
+def _path_matches(rel: str, glob: str) -> bool:
+    """判断仓库内相对路径是否匹配调用方给的 glob。
+
+    Path.match() 的语义很容易踩坑：`Path("src/click/core.py").match("src/click/core.py")`
+    是 **False**（match 从右往左按段匹配，模式段数不能超过路径）。模型很自然会传
+    "src/click/core.py" 这种完整相对路径，因此这里同时接受三种写法：
+      * 通配模式（"*.py"、"*service*.py"、"src/**/*.py"）→ 走 Path.match
+      * 完整相对路径（"src/click/core.py"）→ 精确比较
+      * 只有文件名（"core.py"）→ 比较 basename
+    """
+    pattern = str(glob or "").strip().replace("\\", "/").lstrip("./")
+    if not pattern:
+        return True
+    rel_posix = str(rel).replace("\\", "/")
+    if rel_posix == pattern or rel_posix.endswith("/" + pattern):
+        return True
+    if Path(rel_posix).name == pattern:
+        return True
+    try:
+        if Path(rel_posix).match(pattern):
+            return True
+    except ValueError:
+        pass
+    return False
+
+
+def _read_text(path: Path, size: int | None = None) -> str:
+    """读取文本文件内容。
+
+    调用方可以传入已经 stat 过的 size；大小上限的判断放在调用方，
+    因为"整读"和"范围读"的代价完全不同（见 read_file）。
+    """
+    if size is None:
+        size = path.stat().st_size
     if not _is_probably_text(path):
         raise ToolError(f"看起来不是文本文件，已跳过：{path.name}")
     try:
@@ -153,7 +191,11 @@ def list_directory(root: Path, rel_path: str = ".") -> str:
 
 
 def search_code(root: Path, keyword: str, glob: str | None = None, max_hits: int = DEFAULT_SEARCH_HITS) -> str:
-    """按关键字搜索仓库内的文本文件，返回 文件:行号 与命中行。"""
+    """按关键字搜索仓库内的文本文件，返回 文件:行号 与命中行。
+
+    keyword 是**字面匹配**（不区分大小写的子串查找），不是正则表达式。
+    如果关键词里出现正则符号（.|*?+[]() 等），命中率会骤降，因此下面会给出纠正提示。
+    """
     keyword = (keyword or "").strip()
     if not keyword:
         raise ToolError("keyword 不能为空")
@@ -173,11 +215,11 @@ def search_code(root: Path, keyword: str, glob: str | None = None, max_hits: int
         root,
         max_files=10_000,
         max_depth=repo_service.MAX_TREE_DEPTH,
-        max_size=MAX_TEXT_FILE_SIZE,
+        max_size=SEARCH_MAX_FILE_SIZE,
         # 与 read_file 用同一个判定：搜得到的文件必然读得到
         predicate=_is_probably_text,
     ):
-        if glob and not Path(rel).match(glob):
+        if glob and not _path_matches(rel, glob):
             continue
         scanned += 1
         for lineno, line in enumerate(content.splitlines(), 1):
@@ -187,6 +229,15 @@ def search_code(root: Path, keyword: str, glob: str | None = None, max_hits: int
                     return "\n".join(hits) + f"\n（命中数已达上限 {limit}，如需更多请缩小关键词）"
 
     if not hits:
+        # 关键词里带正则符号是最常见的空结果原因：明确纠正，别让模型原地换词重试
+        if _REGEX_META_RE.search(keyword):
+            return (
+                f"没有找到 {keyword!r}（已扫描 {scanned} 个文本文件）。\n"
+                "注意：本工具是**字面匹配，不支持正则表达式**。"
+                f"{keyword!r} 里的符号（.|*?+[]() 等）被当成普通字符查找了，"
+                "例如 'a|b' 会去找连在一起的 'a|b'。\n"
+                "请拆成单个关键词分别搜索，例如先搜 'a' 再搜 'b'。"
+            )
         return (
             f"没有找到 {keyword!r}（已扫描 {scanned} 个文本文件）。\n"
             "建议：换更短或用词根的关键词（例如只留函数名的一部分）、"
@@ -197,14 +248,37 @@ def search_code(root: Path, keyword: str, glob: str | None = None, max_hits: int
 
 
 def read_file(root: Path, rel_path: str, start: int | None = None, end: int | None = None) -> str:
-    """读取仓库内某个文件的行范围，返回带行号的内容。"""
+    """读取仓库内某个文件的行范围，返回带行号的内容。
+
+    大小限制只针对**整读**（没给 start/end）：
+    "读 120 行"和"读整个 161 KB 的文件"代价完全不同，因此给了范围就不受文件大小限制——
+    否则大文件（如 click 的 core.py）会因为整读上限而被一刀切拒绝，模型再也读不到它。
+    """
     target = _resolve_in_repo(root, rel_path)
     if not target.exists():
         raise ToolError(f"文件不存在：{rel_path}")
     if target.is_dir():
         raise ToolError(f"{rel_path} 是目录，请用 list_directory")
 
-    text = _read_text(target)
+    try:
+        size = target.stat().st_size
+    except OSError as e:
+        raise ToolError(f"读取失败：{e}") from e
+
+    ranged = start is not None or end is not None
+    if size > HARD_READ_BYTES:
+        raise ToolError(
+            f"文件过大（{size} 字节），已跳过。请用 search_code 定位行号后，"
+            "改用 read_file(rel_path, start, end) 只读需要的片段。"
+        )
+    if not ranged and size > MAX_TEXT_FILE_SIZE:
+        raise ToolError(
+            f"文件较大（{size} 字节 > 整读上限 {MAX_TEXT_FILE_SIZE}）。"
+            "**请分两次调用**：先用 search_code 找到目标行号，"
+            "再用 read_file(rel_path, start, end) 按范围读——按范围读不受大小限制。"
+        )
+
+    text = _read_text(target, size)
     all_lines = text.splitlines()
     total = len(all_lines)
     if total == 0:
@@ -288,12 +362,25 @@ TOOL_SCHEMAS: list[dict] = [
             "description": (
                 "在仓库文本文件中按关键字搜索（不区分大小写），返回 文件:行号 与命中行。"
                 "适合查找函数名、接口路径、配置项、错误信息等。"
+                "注意：keyword 是**字面匹配**，不是正则表达式——"
+                "不要用 | 连接多个词（如 'a|b' 会被当成一整串字符，永远匹配不到），"
+                "也不要写 .* 或 \\d 之类的正则符号；一次只搜一个词或符号，多个词请分多次调用。"
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "keyword": {"type": "string", "description": "要搜索的关键字或符号"},
-                    "glob": {"type": "string", "description": "可选，按路径过滤，例如 '*service*.py'"},
+                    "keyword": {
+                        "type": "string",
+                        "description": "要搜索的关键字或符号（字面匹配，不支持正则，一次一个）",
+                    },
+                    "glob": {
+                        "type": "string",
+                        "description": (
+                            "可选，按路径过滤文件。两种写法都支持："
+                            "通配模式（如 '*service*.py'、'src/**/*.py'）"
+                            "或完整相对路径/文件名（如 'src/click/core.py'、'core.py'）"
+                        ),
+                    },
                     "max_hits": {"type": "integer", "description": f"最多返回多少条命中（默认 {DEFAULT_SEARCH_HITS}）"},
                 },
                 "required": ["keyword"],
