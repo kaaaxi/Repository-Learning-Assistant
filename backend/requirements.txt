@@ -2,4 +2,11 @@ fastapi==0.115.12
 uvicorn==0.34.2
 pydantic==2.11.4
 python-dotenv==1.1.0
-httpx==0.28.1
+# Model request layer uses the openai SDK (DeepSeek exposes an OpenAI-compatible API).
+# Verified against openai 3.31.0: exception classes (AuthenticationError / RateLimitError /
+# APIConnectionError / APITimeoutError), chat.completions.create(max_tokens=..., tools=...)
+# and OpenAI(base_url=..., timeout=..., max_retries=...) all work as used here.
+# Note: SDK 3.x pulls in httpx2, so httpx is no longer a direct dependency of this project.
+# Tool registry, argument validation, tool execution, result feed-back and loop limits
+# remain implemented in this project.
+openai>=3.31,<4

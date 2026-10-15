@@ -22,6 +22,11 @@ SECRETS_FILE = Path(os.getenv("REPOASSISTANT_SECRETS_FILE") or DEFAULT_SECRETS_F
 # 分析结果缓存有效期（秒）；设为 0 表示只要缓存存在就直接复用。
 ANALYSIS_CACHE_TTL = int(os.getenv("ANALYSIS_CACHE_TTL", str(24 * 60 * 60)))
 
+# Agent 问答的循环上限（对应 docs/AGENT-STAGE0.md 第 9 节的停止标准）。
+AGENT_MAX_STEPS = int(os.getenv("AGENT_MAX_STEPS", "8"))              # 单次问答最多调用多少次工具
+AGENT_TIMEOUT_SECONDS = float(os.getenv("AGENT_TIMEOUT_SECONDS", "90"))  # 单次问答的墙钟时间上限
+AGENT_CONTEXT_BUDGET = int(os.getenv("AGENT_CONTEXT_BUDGET", "60000"))   # 回喂给模型的工具结果总字符预算
+
 _DEFAULT_ALLOWED_ORIGINS = "http://localhost:5173,http://127.0.0.1:5173,http://localhost:4173,http://127.0.0.1:4173"
 
 _SECRETS_TEMPLATE = {

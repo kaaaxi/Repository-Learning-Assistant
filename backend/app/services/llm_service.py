@@ -2,7 +2,14 @@ import json
 import logging
 import re
 
-import httpx
+from openai import (
+    APIConnectionError,
+    APITimeoutError,
+    AuthenticationError,
+    OpenAI,
+    PermissionDeniedError,
+    RateLimitError,
+)
 
 from app.config import (
     DEMO_MODE,
@@ -12,6 +19,16 @@ from app.config import (
 )
 
 logger = logging.getLogger("repoassistant.llm")
+
+DEFAULT_BASE_URL = "https://api.deepseek.com"
+
+# 请求层参数：超时与 SDK 内置退避重试次数
+_REQUEST_TIMEOUT_SECONDS = 120.0
+_SDK_MAX_RETRIES = 2
+
+
+class LLMNotConfigured(RuntimeError):
+    """没配密钥却尝试调用模型。"""
 
 ANALYSIS_SYSTEM_PROMPT = """\
 你是一个 GitHub 仓库分析助手。根据用户提供的仓库上下文信息，生成结构化的项目分析结果。
@@ -208,43 +225,115 @@ def _short_error(exc: BaseException) -> str:
     return text[:200]
 
 
-def _call_chat(messages: list[dict]) -> tuple[dict | None, str | None]:
-    """返回 (响应 JSON, 错误描述)。任何失败都会记录日志并把原因交给调用方，不再静默。"""
-    url = chat_completions_url(DEEPSEEK_BASE_URL)
-    try:
-        resp = httpx.post(
-            url,
-            headers={"Authorization": f"Bearer {DEEPSEEK_API_KEY}"},
-            json={
-                "model": DEEPSEEK_MODEL,
-                "messages": messages,
-                "temperature": 0.3,
-                # 分析结果是长 JSON，4096 容易在中途被截断（表现为 Unterminated string），
-                # 这里给足余量；不同服务端的上限不同，被拒时会回退规则分析并显示原因。
-                "max_tokens": _MAX_OUTPUT_TOKENS,
-            },
-            timeout=120,
-        )
-        resp.raise_for_status()
-        return resp.json(), None
-    except httpx.HTTPStatusError as e:
-        reason = f"HTTP {e.response.status_code} {_short_error(e)}"
-    except httpx.HTTPError as e:
-        reason = f"请求失败：{_short_error(e)}"
-    except ValueError as e:
-        reason = f"响应不是合法 JSON：{_short_error(e)}"
-    except Exception as e:  # 兜底：任何未知异常都不再吞掉
-        reason = f"{e.__class__.__name__}：{_short_error(e)}"
-
-    logger.warning("LLM 调用失败（%s）：%s", DEEPSEEK_MODEL, reason)
-    return None, reason
-
-
 def _extract_content(response: dict) -> tuple[str | None, str | None]:
     try:
         return response["choices"][0]["message"]["content"], None
     except (KeyError, IndexError, TypeError):
         return None, "响应结构不符合 OpenAI 兼容格式（缺少 choices[0].message.content）"
+
+
+def log_llm_error(scope: str, reason: str) -> None:
+    """给上层（Agent 循环等）复用同一套日志出口，保证失败原因都留在服务端日志里。"""
+    logger.warning("%s：%s", scope, reason)
+
+
+# ---------------------------------------------------------------------------
+# 模型请求层（openai SDK）
+#   * SDK 只负责"接入"：拼请求、读响应、分类异常、退避重试；
+#   * 工具声明、参数校验、工具执行、结果回传、循环上限仍在本项目里实现。
+# ---------------------------------------------------------------------------
+
+def sdk_base_url(base_url: str) -> str:
+    """把配置里的 base_url 归一化成 SDK 需要的形式。
+
+    SDK 会在 base_url 后自动拼 `/chat/completions`，所以这里必须补上 `/v1`；
+    带尾斜杠、已带 `/v1` 的写法都要吃得下。
+    """
+    url = (base_url or "").strip().rstrip("/")
+    if not url:
+        url = DEFAULT_BASE_URL
+    if not url.endswith("/v1"):
+        url += "/v1"
+    return url
+
+
+def _client() -> OpenAI:
+    """按当前配置构造 SDK 客户端（每次新建，便于测试替换与配置变更生效）。"""
+    if not DEEPSEEK_API_KEY:
+        raise LLMNotConfigured("未配置 DEEPSEEK_API_KEY")
+    return OpenAI(
+        api_key=DEEPSEEK_API_KEY,
+        base_url=sdk_base_url(DEEPSEEK_BASE_URL),
+        timeout=_REQUEST_TIMEOUT_SECONDS,
+        max_retries=_SDK_MAX_RETRIES,
+    )
+
+
+def _describe_sdk_error(exc: BaseException) -> str:
+    """把 SDK 的分类异常翻成可执行的中文原因，供前端直接展示。"""
+    status = getattr(exc, "status_code", None)
+    if isinstance(exc, AuthenticationError) or status == 401:
+        return f"鉴权失败（HTTP {status or 401}）：请检查 API Key 是否有效"
+    if isinstance(exc, PermissionDeniedError) or status == 403:
+        return f"无访问权限（HTTP {status or 403}）：该密钥可能无权调用此模型"
+    if isinstance(exc, RateLimitError) or status == 429:
+        return f"触发限流（HTTP {status or 429}）：请稍后重试或降低调用频率"
+    if isinstance(exc, APITimeoutError):
+        return f"请求超时（{int(_REQUEST_TIMEOUT_SECONDS)} 秒）：可缩小问题范围后重试"
+    if status == 400:
+        return f"请求被服务端拒绝（HTTP 400）：多半是模型名或参数不受支持 —— {_short_error(exc)}"
+    if status == 404:
+        return f"接口或模型不存在（HTTP 404）：请检查 DEEPSEEK_BASE_URL 与 DEEPSEEK_MODEL —— {_short_error(exc)}"
+    if status and status >= 500:
+        return f"服务端错误（HTTP {status}）：稍后重试 —— {_short_error(exc)}"
+    if isinstance(exc, APIConnectionError):            # 含 APITimeoutError 之外的连接问题
+        return f"网络不通或服务不可达：{_short_error(exc)}"
+    if status:
+        return f"HTTP {status} {_short_error(exc)}"
+    return f"{exc.__class__.__name__}：{_short_error(exc)}"
+
+
+def request_chat_completion(
+    messages: list[dict],
+    tools: list[dict] | None = None,
+    temperature: float = 0.3,
+) -> tuple[dict | None, str | None]:
+    """调用一次对话补全，可选带上工具定义。
+
+    返回 (响应 JSON, 错误描述)；错误绝不静默。
+    带 tools 且模型决定调用工具时，choices[0].message.tool_calls 会是 OpenAI 兼容结构。
+
+    对上层保持"进出都是 dict"的契约：SDK 的响应对象在这里 model_dump() 成 dict，
+    这样 _extract_content / _extract_tool_calls / 各测试替身都不用关心 SDK 类型。
+    """
+    try:
+        client = _client()
+    except LLMNotConfigured as e:
+        return None, str(e)
+
+    kwargs: dict = {
+        "model": DEEPSEEK_MODEL,
+        "messages": messages,
+        "temperature": temperature,
+        "max_tokens": _MAX_OUTPUT_TOKENS,
+    }
+    if tools:
+        kwargs["tools"] = tools
+        kwargs["tool_choice"] = "auto"
+
+    try:
+        response = client.chat.completions.create(**kwargs)
+    except Exception as e:
+        reason = _describe_sdk_error(e)
+        logger.warning("LLM 调用失败（%s）：%s", DEEPSEEK_MODEL, reason)
+        return None, reason
+
+    return response.model_dump(), None
+
+
+def _call_chat(messages: list[dict]) -> tuple[dict | None, str | None]:
+    """单轮调用（不带工具），返回 (响应 JSON, 错误描述)。"""
+    return request_chat_completion(messages, tools=None)
 
 
 def analyze_with_llm(repo_context: dict) -> tuple[dict | None, str | None]:
