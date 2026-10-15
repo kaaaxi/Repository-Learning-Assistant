@@ -257,16 +257,33 @@ def sdk_base_url(base_url: str) -> str:
     return url
 
 
+_client_cache: tuple[tuple, OpenAI] | None = None
+
+
 def _client() -> OpenAI:
-    """按当前配置构造 SDK 客户端（每次新建，便于测试替换与配置变更生效）。"""
+    """按当前配置返回 SDK 客户端。
+
+    同配置复用同一个实例：SDK 官方要求复用 client，否则每次请求都新建一份连接池。
+    一轮 Agent 问答要调用模型 5~9 次（每次都走这里），复用能省掉重复建连。
+    配置发生变化时（改密钥/地址/超时）签名不同，会自动重建。
+    """
+    global _client_cache
+
     if not DEEPSEEK_API_KEY:
         raise LLMNotConfigured("未配置 DEEPSEEK_API_KEY")
-    return OpenAI(
+
+    signature = (DEEPSEEK_API_KEY, sdk_base_url(DEEPSEEK_BASE_URL), _REQUEST_TIMEOUT_SECONDS, _SDK_MAX_RETRIES)
+    if _client_cache is not None and _client_cache[0] == signature:
+        return _client_cache[1]
+
+    client = OpenAI(
         api_key=DEEPSEEK_API_KEY,
-        base_url=sdk_base_url(DEEPSEEK_BASE_URL),
+        base_url=signature[1],
         timeout=_REQUEST_TIMEOUT_SECONDS,
         max_retries=_SDK_MAX_RETRIES,
     )
+    _client_cache = (signature, client)
+    return client
 
 
 def _describe_sdk_error(exc: BaseException) -> str:

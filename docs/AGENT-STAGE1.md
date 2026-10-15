@@ -104,7 +104,7 @@ python tests/test_logic.py         # 原有逻辑 69 项
 
 | 测试 | 断言数 | 状态 |
 |---|---|---|
-| test_logic.py | 77 | ✅ 全绿 |
+| test_logic.py | 83 | ✅ 全绿 |
 | test_agent_tools.py | 46 | ✅ 全绿 |
 | test_agent_loop.py | 49 | ✅ 全绿 |
 | test_e2e.py | 45 | ✅ 全绿（真实 openai 3.31.0 + 真实 DeepSeek） |
@@ -147,7 +147,9 @@ evidence=['backend/app/services/search_service.py', 'backend/app/main.py', 'back
     - 新增 `sdk_base_url()` 做 base_url 归一（SDK 会自动拼 `/chat/completions`，必须带 `/v1`），并加断言固定"SDK base_url + /chat/completions == chat_completions_url()"的等价性；
     - 新增 `_describe_sdk_error()`：把 SDK 的类型化异常（401/403/429/超时/连接失败/4xx/5xx）翻成可执行中文提示——这是这次迁移最实在的收益；
     - 新增 `LLMNotConfigured`：未配密钥时返回可读原因而不是抛异常；
-    - 实测环境为 **openai 3.31.0**（依赖 httpx2，httpx 不再是直接依赖），`max_tokens`/`tools`/`tool_choice`/异常类均兼容，且以 `-W error::DeprecationWarning` 运行无告警。
+    - 实测环境为 **openai 3.31.0**（依赖 httpx2，httpx 不再是直接依赖），`max_tokens`/`tools`/`tool_choice`/异常类均兼容，且以 `-W error::DeprecationWarning` 运行无告警；
+    - **客户端复用**：`_client()` 按 `(api_key, base_url, timeout, max_retries)` 签名记忆化，同配置返回同一个 `OpenAI` 实例（复用连接池），配置变化时自动重建。原因是一轮 Agent 问答要调用模型 5~9 次，每次新建客户端等于重复创建连接池；SDK 官方也要求复用 client。
+    - **分层的价值在这次迁移里得到验证**：从 httpx 换成 SDK 只改了 `llm_service.py`、`config.py`、`requirements.txt` 三个文件，`agent_service.py` 与 `repo_tools.py` 一行未动——Agent 循环只管"何时调、调完干什么"，传输层的事（base_url 归一、超时、重试、异常分类）全部留在 `llm_service`。
 
 ## 8. Stage 1 刻意没做（留给后续）
 

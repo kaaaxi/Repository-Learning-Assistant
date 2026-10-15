@@ -468,6 +468,26 @@ def main() -> int:
     config._resolve_api_key = original_resolve
     llm_service.DEEPSEEK_API_KEY = "sk-test-key-for-unit-tests"
 
+    # --- 9c. SDK 客户端：构造参数正确 + 同配置复用 -------------------------
+    section("9c. SDK 客户端构造与复用")
+    _openai_stub.set_responder(lambda kwargs: _openai_stub.final_response("ok"))
+    llm_service._client_cache = None                       # 清掉缓存，观察首次构造
+    llm_service.request_chat_completion([{"role": "user", "content": "hi"}])
+    init = _openai_stub.FakeOpenAI.init_kwargs or {}
+    check_eq("base_url 归一后传给 SDK", init.get("base_url"), "https://api.deepseek.com/v1")
+    check_eq("超时按配置传入", init.get("timeout"), 120.0)
+    check_eq("退避重试次数按配置传入", init.get("max_retries"), 2)
+    check("api_key 已传入且非空", bool(init.get("api_key")), "")
+
+    first_client = llm_service._client()
+    second_client = llm_service._client()
+    check("同配置复用同一个 client 实例（复用连接池）", first_client is second_client, "")
+    llm_service.DEEPSEEK_BASE_URL = "https://other.example.com"
+    check("配置变化后自动重建 client", llm_service._client() is not first_client, "")
+    llm_service.DEEPSEEK_BASE_URL = "https://api.deepseek.com"
+    llm_service._client_cache = None
+    _openai_stub.set_responder(None)
+
     _openai_stub.set_responder(None)
 
     # --- 9b. 输出被截断时的补全 ---------------------------------------------
