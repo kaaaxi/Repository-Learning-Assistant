@@ -11,11 +11,11 @@ from app.config import (
     api_key_hint,
 )
 from app.models import AnalyzeRequest, AnalysisResult, ChatRequest, ChatResponse, HealthResponse
-from app.services import analysis_service, llm_service, repo_service, storage_service
+from app.services import agent_service, analysis_service, llm_service, repo_service, storage_service
 
 logger = logging.getLogger("repoassistant.api")
 
-app = FastAPI(title="RepoAssistant", version="0.2.0")
+app = FastAPI(title="RepoAssistant", version="0.3.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -73,6 +73,27 @@ def chat(req: ChatRequest):
         raise HTTPException(status_code=400, detail="非法的 analysis_id")
     except FileNotFoundError:
         raise HTTPException(status_code=404, detail=f"Analysis not found: {req.analysis_id}")
+
+    use_agent = req.mode == "agent" or (req.mode == "auto" and not DEMO_MODE)
+    if use_agent:
+        outcome = agent_service.ask_repository(analysis, req.question)
+        if outcome.answer is not None:
+            logger.info(
+                "Agent 问答完成：steps=%s stop=%s finished_by=%s 证据=%s 自报依据=%s 轨迹=%s",
+                outcome.steps, outcome.stop_reason, outcome.finished_by, outcome.citations,
+                outcome.claimed_evidence, outcome.trace_text(),
+            )
+            return {
+                "answer": outcome.answer,
+                "source": "agent",
+                "llm_error": outcome.error,          # 因上限停下时，这里说明原因
+                "evidence": outcome.citations,
+                "steps": outcome.steps,
+                "stop_reason": outcome.stop_reason,
+                "finished_by": outcome.finished_by,
+                "trace": [f"{s.step}. {s.tool}({s.arguments})" for s in outcome.trace],
+            }
+        logger.warning("Agent 未给出回答（%s），回退摘要问答：%s", outcome.stop_reason, outcome.error)
 
     answer, llm_error = llm_service.chat_with_llm(analysis, req.question)
     if answer is not None:

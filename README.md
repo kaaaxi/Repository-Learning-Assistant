@@ -13,8 +13,10 @@
 | 层级 | 技术 |
 |------|------|
 | 前端 | Vue 3 + Vite + TypeScript + 原生 CSS + 原生 fetch |
-| 后端 | Python 3.11 + FastAPI + Pydantic + httpx |
+| 后端 | Python 3.11 + FastAPI + Pydantic + openai SDK（`openai>=3.31`） |
 | LLM  | DeepSeek（通过 OpenAI 兼容接口调用，可换成任意兼容模型） |
+
+模型请求层用官方 `openai` SDK，但**只用于接入**：请求组织、响应对象、异常分类与退避重试。工具注册、参数校验、工具执行、结果回传与 Agent 循环上限都由本项目实现。
 
 ## 环境准备
 
@@ -73,6 +75,9 @@ DEEPSEEK_MODEL=deepseek-flash
 | `ALLOWED_ORIGINS` | `localhost` / `127.0.0.1` 的 5173、4173 | 允许跨域访问后端的前端来源 |
 | `REPOASSISTANT_SECRETS_FILE` | `backend/data/secrets.json` | 密钥文件路径 |
 | `REPOASSISTANT_DATA_DIR` | `backend/data` | 运行时数据根目录（仓库缓存与分析结果） |
+| `AGENT_MAX_STEPS` | `8` | Agent 问答单次最多执行多少次工具调用 |
+| `AGENT_TIMEOUT_SECONDS` | `90` | Agent 问答单次墙钟时间上限 |
+| `AGENT_CONTEXT_BUDGET` | `60000` | 回喂给模型的工具结果总字符预算 |
 
 `DEEPSEEK_BASE_URL` 填 `https://api.deepseek.com` 或 `https://api.deepseek.com/v1` 都可以，后端会自动补全 `/v1/chat/completions`，不会再出现 `/v1/v1`。
 
@@ -80,6 +85,20 @@ DEEPSEEK_MODEL=deepseek-flash
 
 - **未配置密钥**：自动进入 Demo 模式。分析结果和问答基于已提取的 README、目录树和配置文件规则生成，不调用 LLM。前端显示黄色提示，并说明密钥该填在哪里。
 - **已配置密钥**：优先调用 LLM。**LLM 调用失败（网络、401、超时、返回格式异常）时，前端会用橙色提示给出具体失败原因**，同时自动回退到规则结果，保证系统不崩溃。
+
+### 代码问答 Agent（Stage 1）
+
+配置密钥后，"仓库问答"不再只依赖预生成的分析摘要——模型可以在**已下载的仓库里自主探索**后回答：
+
+| 工具 | 作用 |
+|------|------|
+| `list_directory(rel_path)` | 查看目录结构 |
+| `search_code(keyword, glob?, max_hits?)` | 按关键字/符号定位，返回 `文件:行号` 与命中行 |
+| `read_file(rel_path, start?, end?)` | 读取文件片段（带行号） |
+
+典型过程：搜索定位 → 读入口文件 → 发现调用关系 → 再读下一个文件 → 证据足够才作答，回答里会给出文件与行号。接口会返回 `evidence`（实际读过的文件）、`steps`、`stop_reason` 与 `trace`（工具调用轨迹）。
+
+安全与上限：工具**只读**，路径被限制在仓库目录内（越界/绝对路径/超大文件/非文本都会被拒绝并回告模型）；单次问答受 `AGENT_MAX_STEPS`、`AGENT_TIMEOUT_SECONDS`、`AGENT_CONTEXT_BUDGET` 限制；因为上限停下时仍会返回"已确认的结论 + 缺什么"，不会让请求失败。设计依据见 [docs/AGENT-STAGE0.md](docs/AGENT-STAGE0.md)，实现记录见 [docs/AGENT-STAGE1.md](docs/AGENT-STAGE1.md)。
 
 ## 启动
 
@@ -143,29 +162,30 @@ npm run dev
 | GET | `/api/health` | 返回是否 Demo 模式、当前模型名、密钥来源（不含密钥内容） |
 | POST | `/api/analyze` | 请求体 `{"repo_url": "...", "force_refresh": false}`，`force_refresh=true` 忽略缓存强制重新分析 |
 | GET | `/api/analysis/{id}` | 读取已保存的分析结果 |
-| POST | `/api/chat` | 请求体 `{"analysis_id": "...", "question": "..."}` |
+| POST | `/api/chat` | 请求体 `{"analysis_id": "...", "question": "...", "mode": "auto"}`；`mode` 可选 `auto`（有密钥走 Agent）/ `agent`（强制 Agent）/ `summary`（只用已有摘要） |
+
+`/api/chat` 的响应字段：`answer`、`source`（`agent` / `llm` / `fallback`）、`llm_error`、`evidence`（Agent 读过的文件）、`steps`、`stop_reason`、`trace`。
 
 ## 测试
 
-两套测试都是可直接运行的脚本，成功时退出码为 0。
+四套测试都是可直接运行的脚本，成功时退出码为 0，全部在 `backend/tests/` 下。
 
-**1）逻辑测试（59 项断言）**：不需要安装任何第三方依赖，脚本内部会替换掉 fastapi / pydantic / httpx。
+| 脚本 | 断言数 | 依赖 | 说明 |
+|---|---|---|---|
+| `test_logic.py` | 77 | 无（自带替身） | 配置/密钥、目录树解析、缓存、校验、路径穿越、SDK 错误分类 |
+| `test_agent_tools.py` | 46 | 无 | 三个只读工具的真实文件操作与安全边界、注册表一致性 |
+| `test_agent_loop.py` | 49 | 无 | Agent 循环：多轮探索、工具回喂、finish 结束、步数/超时/重复/报错处理 |
+| `test_e2e.py` | 45 | 真实依赖 | 真实 HTTP 接口 + 真实规则/LLM 分析 + 真实 Agent 工具调用 |
 
 ```bash
 cd backend
 python tests/test_logic.py
-```
-
-覆盖点：密钥来源优先级与单行清洗、GitHub 地址校验与缓存键归一、目录树层级解析、源码抽样路径、monorepo 配置识别、目录树截断顺序、README 链接清洗、LLM 端点拼接、LLM 失败原因上报、缓存 TTL 与强制刷新、问答回退、analysis_id 路径穿越防护、入参校验、健康检查不泄露密钥。
-
-**2）集成测试（33 项断言）**：用真实依赖跑完整链路（真实 HTTP 接口、真实规则/LLM 分析、真实落盘），需要在装好依赖的环境里运行。
-
-```bash
-cd backend
+python tests/test_agent_tools.py
+python tests/test_agent_loop.py
 python tests/test_e2e.py
 ```
 
-它会自己造一个多层级示例仓库，按 `clone_repo` 的目录约定预置好，然后验证目录树/配置/源码抽取、分析结果结构、缓存与 `force_refresh`、问答、健康检查与失败提示。运行目录默认取系统临时目录（可用 `REPOASSISTANT_DATA_DIR` 指定），不会污染 `backend/data/`。
+`test_e2e.py` 会自己造一个多层级示例仓库（含跨文件调用链），按 `clone_repo` 的目录约定预置好，然后验证目录树/配置/源码抽取、分析结果结构、缓存与 `force_refresh`、问答、Agent 工具调用、健康检查与失败提示。运行目录默认取系统临时目录（可用 `REPOASSISTANT_DATA_DIR` 指定），不会污染 `backend/data/`。若已配置密钥，其中的 Agent 用例会真实调用模型并断言它确实搜索并读取了文件。
 
 ## 已知边界
 
@@ -182,19 +202,26 @@ python tests/test_e2e.py
 backend/
   app/
     main.py              # FastAPI 入口与路由
-    config.py            # 配置与密钥加载（环境变量 > secrets.json）
+    config.py            # 配置与密钥加载（环境变量 > secrets.json）+ Agent 上限
     models.py            # 请求/响应模型，LLM 输出也用它校验
     urls.py              # GitHub 地址规则（校验层与抓取层共用）
     services/
       repo_service.py      # 克隆、目录树、配置与源码抽取
       analysis_service.py  # 分析编排、规则分析、问答兜底
-      llm_service.py       # LLM 调用与失败原因上报
+      llm_service.py       # LLM 调用（含 tools 透传）与失败原因上报
+      repo_tools.py        # Agent 的三个只读工具（list/search/read）
+      agent_service.py     # Agent 循环：tool call 解析、执行、回喂、上限控制
       storage_service.py   # 分析结果落盘（含 id 合法性校验）
   tests/
-    test_logic.py        # 无依赖逻辑测试（59 项）
-    test_e2e.py          # 真实栈集成测试（33 项）
+    test_logic.py        # 无依赖逻辑测试（69 项）
+    test_agent_tools.py  # 工具层测试（28 项）
+    test_agent_loop.py   # Agent 循环测试（34 项）
+    test_e2e.py          # 真实栈集成测试（44 项）
   data/                  # 运行时数据：secrets.json、repos/、analyses/（全部被 git 忽略）
 frontend/
   src/App.vue            # 单文件页面：分析结果、侧边栏、问答弹窗
   src/style.css          # GitHub 风格样式
+docs/
+  AGENT-STAGE0.md        # Agent 适用性与功能边界说明
+  AGENT-STAGE1.md        # 最小可用 Agent 循环的产出记录
 ```

@@ -19,12 +19,22 @@ class ChatRequest(BaseModel):
     analysis_id: str = Field(..., min_length=1, max_length=64)
     # 不加约束的 str 会忽略 min_length，空问题必须在入口就被拒
     question: str = Field(..., min_length=1, max_length=2000)
+    mode: str = Field("auto", description="auto=有密钥时用 Agent 探索；agent=强制 Agent；summary=只用已有摘要")
 
 
 class ChatResponse(BaseModel):
     answer: str
-    source: str
+    source: str = Field(..., description="agent / llm / fallback")
     llm_error: str | None = None
+    evidence: list[str] = Field(default_factory=list, description="Agent 实际读过的文件（证据清单）")
+    steps: int = 0
+    stop_reason: str | None = Field(
+        None, description="final_answer / step_limit / time_limit / no_new_info / llm_error"
+    )
+    finished_by: str | None = Field(
+        None, description="结束方式：finish_tool（显式调用 finish）/ content（正文直接作答）/ forced_conclusion（触限后收尾）"
+    )
+    trace: list[str] = Field(default_factory=list, description="工具调用轨迹，便于调试与教学")
 
 
 class HealthResponse(BaseModel):
@@ -76,3 +86,4 @@ class AnalysisResult(BaseModel):
     analysis_mode: str = "demo"
     analyzed_at: str | None = None
     llm_error: str | None = None
+    repo_path: str | None = Field(None, description="本地克隆目录，Agent 问答据此读取源码")

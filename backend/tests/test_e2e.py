@@ -76,8 +76,37 @@ def build_sample_repo(root: Path) -> Path:
     (root / "frontend" / "src" / "components").mkdir(parents=True)
     (root / "scripts").mkdir()
     (root / "docs").mkdir()
-    (root / "backend" / "app" / "main.py").write_text("def main():\n    return 1\n", encoding="utf-8")
-    (root / "backend" / "app" / "services" / "worker.py").write_text("def work():\n    return 2\n", encoding="utf-8")
+    (root / "backend" / "app" / "main.py").write_text(
+        "from app.services.search_service import search_code\n"
+        "\n"
+        "\n"
+        "def handle_search(keyword):\n"
+        "    hits = search_code(keyword)\n"
+        "    return {'keyword': keyword, 'hits': hits}\n",
+        encoding="utf-8",
+    )
+    (root / "backend" / "app" / "services" / "worker.py").write_text(
+        "from app.services.search_service import search_code\n"
+        "\n"
+        "\n"
+        "def work(keyword):\n"
+        "    return len(search_code(keyword))\n",
+        encoding="utf-8",
+    )
+    # 这个符号被两个文件调用，适合验证"搜索 → 读实现 → 追调用点"的 Agent 链路
+    (root / "backend" / "app" / "services" / "search_service.py").write_text(
+        '"""极简搜索实现。"""\n'
+        "\n"
+        "INDEX = {}\n"
+        "\n"
+        "\n"
+        "def search_code(keyword):\n"
+        '    """按关键字返回命中的文件列表。"""\n'
+        "    if not keyword:\n"
+        "        return []\n"
+        "    return [path for path, text in INDEX.items() if keyword in text]\n",
+        encoding="utf-8",
+    )
     (root / "backend" / "requirements.txt").write_text("fastapi==0.115.12\nuvicorn==0.34.2\n", encoding="utf-8")
     (root / "frontend" / "package.json").write_text(
         json.dumps({"name": "web", "scripts": {"dev": "vite", "build": "vue-tsc -b && vite build"}}),
@@ -141,7 +170,9 @@ def main() -> int:
         and any("/" in n for n in names) and "small.py" in names, str(names))
     key_files = asvc._collect_key_files_by_dir(cloned, dirs)
     rec("关键模块路径真实且完整",
-        key_files.get("backend") == ["app/main.py", "app/services/worker.py"], str(key_files))
+        "app/main.py" in key_files.get("backend", []) and "app/services/worker.py" in key_files.get("backend", [])
+        and all((cloned / d / f).exists() for d, fs in key_files.items() for f in fs),
+        str(key_files))
 
     print("=== 5. README 清洗 ===")
     overview = asvc.clean_readme_overview(ctx["readme"])
@@ -228,7 +259,8 @@ def main() -> int:
     chat_resp = client.post("/api/chat", json={"analysis_id": data.get("analysis_id"), "question": "这个项目是做什么的？"})
     chat = chat_resp.json() if chat_resp.status_code == 200 else {}
     rec("POST /api/chat 200", chat_resp.status_code == 200, f"{chat_resp.status_code} {chat_resp.text[:150]}")
-    rec("问答带 source 字段", chat.get("source") in ("llm", "fallback"), str(chat.get("source")))
+    rec("问答带 source 字段", chat.get("source") in ("agent", "llm", "fallback"),
+        f"source={chat.get('source')} status={chat_resp.status_code}")
     answer = chat.get("answer") or ""
     if chat.get("source") == "fallback" and chat.get("llm_error"):
         rec("回退回答里带上失败原因", "LLM 调用失败" in answer, answer[-90:])
@@ -242,6 +274,51 @@ def main() -> int:
     print("      health =", json.dumps(health, ensure_ascii=False))
     rec("health 不含密钥内容", "sk-" not in json.dumps(health), "")
     rec("密钥来源字段合法", health.get("api_key_source") in ("env", "file", "none"), str(health.get("api_key_source")))
+
+    print("=== 10b. Agent 问答（Stage 1：模型真的去搜索并读文件）===")
+    agent_symbol = "search_code"
+    agent_question = f"{agent_symbol} 定义在哪个文件？又被哪些文件调用？请给出文件与依据。"
+    payload = {"analysis_id": data.get("analysis_id"), "question": agent_question, "mode": "agent"}
+    agent_resp = client.post("/api/chat", json=payload)
+    agent = agent_resp.json() if agent_resp.status_code == 200 else {}
+    print(f"      source={agent.get('source')} steps={agent.get('steps')} stop={agent.get('stop_reason')} finished_by={agent.get('finished_by')}")
+    print(f"      evidence={agent.get('evidence')}")
+    for line in (agent.get("trace") or [])[:6]:
+        print(f"      trace: {line}")
+    print(f"      回答前 120 字: {(agent.get('answer') or '')[:120]}".replace("\n", " "))
+    rec("Agent 接口返回 200", agent_resp.status_code == 200, f"{agent_resp.status_code} {agent_resp.text[:150]}")
+
+    if health.get("demo_mode"):
+        rec("Demo 模式下 Agent 优雅降级", agent.get("source") in ("agent", "fallback", "llm"), str(agent.get("source")))
+    elif agent.get("source") == "agent":
+        rec("走了 Agent 路径", True, "")
+        rec("真的调用了工具（steps >= 2）", (agent.get("steps") or 0) >= 2, str(agent.get("steps")))
+        rec("工具轨迹含搜索与读取",
+            any("search_code" in t for t in agent.get("trace") or [])
+            and any("read_file" in t for t in agent.get("trace") or []),
+            str(agent.get("trace"))[:200])
+        rec("证据清单是真实存在的文件",
+            bool(agent.get("evidence")) and all((cloned / f).exists() for f in agent.get("evidence") or []),
+            str(agent.get("evidence")))
+        rec("回答引用了目标符号", agent_symbol in (agent.get("answer") or ""), (agent.get("answer") or "")[:120])
+        rec("停止原因合法",
+            agent.get("stop_reason") in ("final_answer", "step_limit", "time_limit", "no_new_info"), str(agent.get("stop_reason")))
+        rec("结束方式可观测",
+            agent.get("finished_by") in ("finish_tool", "content", "forced_conclusion"), str(agent.get("finished_by")))
+    else:
+        # 真实网络偶发失败（SSL EOF/超时）时，Agent 会如实降级到摘要问答——这也是设计行为
+        rec("Agent 失败时优雅降级且原因可见",
+            bool(agent.get("llm_error")) and agent.get("source") in ("llm", "fallback"),
+            f"source={agent.get('source')} llm_error={agent.get('llm_error')}")
+
+    # 保留原有摘要问答作为对照：mode=summary 不应进入 Agent
+    summary_resp = client.post("/api/chat", json={
+        "analysis_id": data.get("analysis_id"), "question": agent_question, "mode": "summary"})
+    summary = summary_resp.json() if summary_resp.status_code == 200 else {}
+    rec("mode=summary 不进入 Agent", summary.get("source") in ("llm", "fallback"),
+        f"source={summary.get('source')} status={summary_resp.status_code} body={summary_resp.text[:120]}")
+    rec("mode 非法值不会 500",
+        client.post("/api/chat", json={"analysis_id": data.get("analysis_id"), "question": "在吗", "mode": "乱填"}).status_code in (200, 400, 422), "")
 
     print("=== 11. 路径穿越与 URL 校验 ===")
     rec("非法 analysis_id 不读任意文件", client.get("/api/analysis/..%2F..%2Fsecrets").status_code in (400, 404), "")

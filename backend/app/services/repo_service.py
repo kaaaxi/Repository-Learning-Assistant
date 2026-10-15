@@ -1,5 +1,6 @@
 import hashlib
 import subprocess
+from collections.abc import Callable
 from pathlib import Path
 
 from app.config import REPOS_DIR
@@ -18,6 +19,9 @@ IGNORED_DIRS = {
     ".git", "node_modules", "dist", "build", "target", "venv", ".venv",
     "__pycache__", ".next", ".nuxt", "coverage", ".cache", ".tox", "egg-info",
 }
+
+# 明确要跳过的文件（点文件不再一律跳过，这里只列噪音文件）
+IGNORED_FILENAMES = {".DS_Store", "Thumbs.db", "desktop.ini"}
 
 README_NAMES = ["README.md", "README.rst", "README.txt", "README", "readme.md"]
 
@@ -97,22 +101,30 @@ def extract_readme(repo_path: Path) -> str | None:
     return None
 
 
-def _iter_visible_entries(directory: Path) -> list[Path]:
-    """排序后的可见条目：目录优先、名称不区分大小写；忽略项在截断之前就被剔除。"""
+def iter_visible_entries(directory: Path) -> list[Path]:
+    """排序后的可见条目：目录优先、名称不区分大小写；忽略项在截断之前就被剔除。
+
+    这是全仓库唯一的"哪些文件算可见"的定义，目录树、配置抽取、源码抽样与
+    Agent 工具（list_directory）都复用它，避免各处规则不一致。
+
+    这里不再一刀切地跳过所有点开头的条目：`.gitignore`、`.env.example`、`.github/workflows/*`
+    都是理解项目的重要线索。真正的噪音（.git、.venv、.DS_Store…）由 IGNORED_DIRS /
+    IGNORED_FILENAMES 明确列出。
+    """
     try:
         entries = sorted(directory.iterdir(), key=lambda p: (not p.is_dir(), p.name.lower()))
     except OSError:
         return []
     return [
         entry for entry in entries
-        if entry.name not in IGNORED_DIRS and not entry.name.startswith(".")
+        if entry.name not in IGNORED_DIRS and entry.name not in IGNORED_FILENAMES
     ]
 
 
 def build_directory_tree(repo_path: Path, depth: int = 0, max_depth: int = MAX_TREE_DEPTH) -> dict:
     if depth >= max_depth:
         return {}
-    entries = _iter_visible_entries(repo_path)[:MAX_TREE_ENTRIES_PER_DIR]
+    entries = iter_visible_entries(repo_path)[:MAX_TREE_ENTRIES_PER_DIR]
     tree: dict = {}
     for entry in entries:
         if entry.is_dir():
@@ -191,7 +203,7 @@ def _walk_directories(repo_path: Path, max_depth: int) -> list[Path]:
         found.append(directory)
         if depth >= max_depth:
             return
-        for entry in _iter_visible_entries(directory):
+        for entry in iter_visible_entries(directory):
             if entry.is_dir():
                 walk(entry, depth + 1)
 
@@ -204,19 +216,33 @@ def iter_source_files(
     max_files: int = MAX_SOURCE_FILES,
     max_depth: int = 3,
     max_size: int = MAX_SOURCE_FILE_SIZE,
+    suffixes: set[str] | None = None,
+    predicate: Callable[[Path], bool] | None = None,
 ) -> list[tuple[str, str]]:
-    """返回 [(仓库内相对路径, 文件内容)]，跳过被忽略目录、超大文件和过深的层级。"""
+    """返回 [(仓库内相对路径, 文件内容)]，跳过被忽略目录、超大文件和过深的层级。
+
+    三种选择方式，优先级从高到低：
+      * predicate：自定义判定（例如"能当文本读"的完整判断，含内容嗅探）；
+      * suffixes：按后缀集合筛选；
+      * 都不传：按概览阶段的源码后缀（SOURCE_EXTENSIONS）筛选。
+    """
+    wanted = SOURCE_EXTENSIONS if suffixes is None else suffixes
     results: list[tuple[str, str]] = []
+
+    def selected(entry: Path) -> bool:
+        if predicate is not None:
+            return predicate(entry)
+        return entry.suffix in wanted
 
     def walk(directory: Path, depth: int) -> None:
         if len(results) >= max_files or depth > max_depth:
             return
-        for entry in _iter_visible_entries(directory):
+        for entry in iter_visible_entries(directory):
             if len(results) >= max_files:
                 return
             if entry.is_dir():
                 walk(entry, depth + 1)
-            elif entry.suffix in SOURCE_EXTENSIONS:
+            elif selected(entry):
                 try:
                     if entry.stat().st_size > max_size:
                         continue

@@ -417,6 +417,9 @@ def analyze(repo_url: str, force_refresh: bool = False) -> dict:
 
     result["analyzed_at"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
     result["llm_error"] = llm_error
+    # 记录下来源仓库目录：Agent 问答在请求时是重新加载分析结果的，
+    # 只有持久化了这个路径，它才能找到本地代码去读（缓存被清理时会自动提示重新分析）。
+    result["repo_path"] = ctx.get("repo_path")
     storage_service.save_analysis(analysis_id, result)
     return result
 

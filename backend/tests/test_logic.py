@@ -1,4 +1,4 @@
-"""RepoAssistant 后端逻辑回归测试（无需安装 fastapi/httpx/pydantic 等依赖）。
+"""RepoAssistant 后端逻辑回归测试（无需安装 fastapi/openai/pydantic 等依赖）。
 
 运行方式：
     python backend/tests/test_logic.py
@@ -17,30 +17,24 @@ from pathlib import Path
 
 BACKEND_DIR = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(BACKEND_DIR))
+sys.path.insert(0, str(Path(__file__).resolve().parent))     # 让 _openai_stub 可导入
+
+import _openai_stub  # noqa: E402
 
 # ---------------------------------------------------------------------------
 # 第三方库替身（仅在测试进程内生效）
 # ---------------------------------------------------------------------------
 
 
-def _install_httpx_stub() -> types.ModuleType:
-    module = types.ModuleType("httpx")
+def _install_openai_stub() -> types.ModuleType:
+    """openai SDK 的替身（实现在 _openai_stub.py，与其它测试共用）。
 
-    class HTTPError(Exception):
-        pass
-
-    class HTTPStatusError(HTTPError):
-        def __init__(self, message: str, response=None):
-            super().__init__(message)
-            self.response = response
-
-    def post(*args, **kwargs):  # pragma: no cover - 测试里总是被替换
-        raise HTTPError("httpx stub: post() 未被替换")
-
-    module.HTTPError = HTTPError
-    module.HTTPStatusError = HTTPStatusError
-    module.post = post
-    return module
+    请求层已从"直接 httpx.post"改为"openai SDK"，所以这里要伪装 SDK 本身：
+      * OpenAI(...) 记录构造参数（用于断言 base_url / 超时 / 重试次数）；
+      * client.chat.completions.create(**kwargs) 返回由 set_responder 控制的假响应；
+      * 异常层级与真实 SDK 一致，方便测试 _describe_sdk_error 的分类。
+    """
+    return _openai_stub.install()
 
 
 def _install_dotenv_stub() -> types.ModuleType:
@@ -212,7 +206,7 @@ _TYPES = {"str": str, "int": int, "bool": bool, "float": float, "list": list, "d
 def _install_stubs(secrets_file: Path) -> None:
     os.environ["REPOASSISTANT_SECRETS_FILE"] = str(secrets_file)
     os.environ.pop("DEEPSEEK_API_KEY", None)
-    sys.modules["httpx"] = _install_httpx_stub()
+    sys.modules["openai"] = _install_openai_stub()
     sys.modules["dotenv"] = _install_dotenv_stub()
     sys.modules["pydantic"] = _install_pydantic_stub()
     fastapi, cors = _install_fastapi_stub()
@@ -403,8 +397,8 @@ def main() -> int:
     )
     check("带括号的链接被完整替换", cleaned == "看 文档 和 。", repr(cleaned))
 
-    # --- 8. base_url 拼接（#5） --------------------------------------------
-    section("8. LLM 端点拼接")
+    # --- 8. base_url 归一（#5） --------------------------------------------
+    section("8. LLM 端点与 base_url 归一")
     check_eq("默认地址", llm_service.chat_completions_url("https://api.deepseek.com"),
              "https://api.deepseek.com/v1/chat/completions")
     check_eq("已带 /v1", llm_service.chat_completions_url("https://api.deepseek.com/v1"),
@@ -414,20 +408,19 @@ def main() -> int:
     check_eq("空值回退到默认", llm_service.chat_completions_url(""),
              "https://api.deepseek.com/v1/chat/completions")
 
+    # SDK 会在 base_url 之后自动拼 /chat/completions，所以传给 SDK 的必须带 /v1
+    check_eq("SDK 用的 base_url 带 /v1", llm_service.sdk_base_url("https://api.deepseek.com"),
+             "https://api.deepseek.com/v1")
+    check_eq("SDK 用的 base_url 不重复拼 /v1", llm_service.sdk_base_url("https://api.deepseek.com/v1/"),
+             "https://api.deepseek.com/v1")
+    check_eq("SDK 用的 base_url 空值回退", llm_service.sdk_base_url(""),
+             "https://api.deepseek.com/v1")
+    check_eq("SDK base_url + 路径 == 完整端点",
+             llm_service.sdk_base_url("https://api.deepseek.com") + "/chat/completions",
+             llm_service.chat_completions_url("https://api.deepseek.com"))
+
     # --- 9. LLM 失败不再静默（#3） ------------------------------------------
     section("9. LLM 失败可见")
-
-    def failing_post(*args, **kwargs):
-        raise llm_service.httpx.HTTPError("connection refused")
-
-    def bad_status_post(*args, **kwargs):
-        class Response:
-            status_code = 401
-
-        raise llm_service.httpx.HTTPStatusError("401 Unauthorized", response=Response())
-
-    original_post = llm_service.httpx.post
-    llm_service.httpx.post = failing_post
     ctx = {
         "analysis_id": "abc123abc123",
         "project_name": "fake-repo",
@@ -436,14 +429,46 @@ def main() -> int:
         "directory_tree": tree_text,
         "config_files": {"requirements.txt": "fastapi\n"},
     }
+
+    # 网络不通
+    _openai_stub.set_responder(lambda kwargs: _openai_stub.APIConnectionError("connection refused"))
     result, error = llm_service.analyze_with_llm({**ctx, "sample_sources": snippets})
     check_eq("网络失败返回 None 结果", result, None)
-    check("网络失败返回可读原因", bool(error) and "connection refused" in error, str(error))
+    check("网络失败返回可读原因（含『网络』字样）",
+          bool(error) and "connection refused" in error and "网络" in error, str(error))
 
-    llm_service.httpx.post = bad_status_post
+    # 鉴权失败：应给出可执行提示，而不是只报状态码
+    _openai_stub.set_responder(lambda kwargs: _openai_stub.AuthenticationError("401 Unauthorized", status_code=401))
     result, error = llm_service.analyze_with_llm({**ctx, "sample_sources": snippets})
-    check("HTTP 错误码被识别", bool(error) and "401" in error, str(error))
-    llm_service.httpx.post = original_post
+    check("鉴权失败被分类并给出可执行提示",
+          bool(error) and "鉴权失败" in error and "401" in error, str(error))
+
+    # 限流
+    _openai_stub.set_responder(lambda kwargs: _openai_stub.RateLimitError("429 Too Many Requests", status_code=429))
+    result, error = llm_service.analyze_with_llm({**ctx, "sample_sources": snippets})
+    check("限流被分类", bool(error) and "限流" in error, str(error))
+
+    # 模型名/参数被拒
+    _openai_stub.set_responder(lambda kwargs: _openai_stub.BadRequestError("model not found", status_code=400))
+    result, error = llm_service.analyze_with_llm({**ctx, "sample_sources": snippets})
+    check("400 提示多半是模型名或参数问题", bool(error) and "400" in error, str(error))
+
+    # 服务端错误
+    _openai_stub.set_responder(lambda kwargs: _openai_stub.APIStatusError("500 Internal", status_code=500))
+    result, error = llm_service.analyze_with_llm({**ctx, "sample_sources": snippets})
+    check("5xx 提示稍后重试", bool(error) and "服务端错误" in error, str(error))
+
+    # 未配置密钥：不应抛异常，而是返回可读原因
+    original_resolve = config._resolve_api_key
+    config._resolve_api_key = lambda: ("", "none")
+    llm_service.DEEPSEEK_API_KEY = ""
+    result, error = llm_service.request_chat_completion([{"role": "user", "content": "hi"}])
+    check("未配置密钥时返回可读原因而不抛异常",
+          result is None and bool(error) and "未配置" in error, str(error))
+    config._resolve_api_key = original_resolve
+    llm_service.DEEPSEEK_API_KEY = "sk-test-key-for-unit-tests"
+
+    _openai_stub.set_responder(None)
 
     # --- 9b. 输出被截断时的补全 ---------------------------------------------
     section("9b. LLM 输出截断修复")
@@ -474,26 +499,13 @@ def main() -> int:
     check("完整 JSON 也能解析", llm_service._repair_truncated_json('{"a": 1}') == {"a": 1}, "")
     check("彻底损坏的内容返回 None", llm_service._repair_truncated_json("这不是 JSON") is None, "")
 
-    class TruncatedResponse:
-        @staticmethod
-        def json():
-            return {"choices": [{"message": {"content": '{"overview": "被截断的概述", "code_map": [{"name": "src"'}}]}
-
-    class TruncatedResult:
-        status_code = 200
-
-        def raise_for_status(self):
-            pass
-
-        @staticmethod
-        def json():
-            return TruncatedResponse.json()
-
-    llm_service.httpx.post = lambda *a, **k: TruncatedResult()
+    _openai_stub.set_responder(lambda kwargs: {
+        "choices": [{"message": {"content": '{"overview": "被截断的概述", "code_map": [{"name": "src"'}}]
+    })
     result, error = llm_service.analyze_with_llm({**ctx, "sample_sources": snippets})
     check("截断输出被修复后不再回退", isinstance(result, dict) and result.get("overview") == "被截断的概述" and error is None,
           f"result={result!r} error={error!r}")
-    llm_service.httpx.post = original_post
+    _openai_stub.set_responder(None)
 
     # --- 10. 缓存语义（#4） ------------------------------------------------
     section("10. 缓存语义")
